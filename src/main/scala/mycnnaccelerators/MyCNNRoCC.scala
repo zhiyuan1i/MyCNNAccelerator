@@ -2,118 +2,175 @@
 package mycnnaccelerators
 
 import chisel3._
-import chisel3.util._ // Make sure Mux, Fill, PopCount, etc. are available
-
+import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
-import freechips.rocketchip.subsystem.MaxXLen
-import freechips.rocketchip.tile._ // Pulls in HasCoreParameters, PRV, etc.
-// M_XWR, M_XRD
-import freechips.rocketchip.diplomacy._
-import freechips.rocketchip.rocket._
-// end
+import freechips.rocketchip.tile._
+import freechips.rocketchip.diplomacy.LazyModule
+import CNNAcceleratorISA._ // Import ISA definitions
 
-
-// Key for accessing the base AcceleratorConfig from the configuration system
+// Key for configuration
 case object MyCNNAcceleratorKey extends Field[AcceleratorConfig](DefaultAcceleratorConfig)
 
 class MyCNNRoCC(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
-  val baseConfig = p(MyCNNAcceleratorKey)
-  val systemMaxXLen = p(MaxXLen)
-  val actualConfig = baseConfig.copy(xLen = systemMaxXLen)
-
-  override lazy val module = new MyCNNRoCCModuleImp(this, actualConfig)
+  val baseConfig = p(MyCNNAcceleratorKey) // Get base config from Parameters
+  // Actual config is created in MyCNNRoCCModuleImp once xLen is known
+  override lazy val module = new MyCNNRoCCModuleImp(this, baseConfig)
 }
 
-class MyCNNRoCCModuleImp(outer: MyCNNRoCC, val config: AcceleratorConfig)(implicit p: Parameters)
-    extends LazyRoCCModuleImp(outer) { // LazyRoCCModuleImp mixes in HasCoreParameters, which brings in MemoryOpConstants, CSRs (for PRV), etc.
+class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(implicit p: Parameters)
+    extends LazyRoCCModuleImp(outer)
+    with HasCoreParameters { // HasCoreParameters provides xLen, etc.
 
-  val controller   = Module(new CNNController(config))
-  val dma          = Module(new SimpleDMAController(config))
-  val spad         = Module(new Scratchpad(config))
+  // Create the actual config using xLen from HasCoreParameters
+  val config = defaultConfig.copy(xLen = xLen)
+
+  // Instantiate internal modules
+  val ifm_buffer = Module(new MinimalBuffer(config.ifmDepth, config.dataWidth))
+  val kernel_buffer = Module(new MinimalBuffer(config.kernelDepth, config.dataWidth))
+  val ofm_buffer = Module(new MinimalBuffer(config.ofmDepth, config.dataWidth))
   val compute_unit = Module(new ComputeUnit(config))
 
-  // RoCC Interface Connections
-  controller.io.cmd_in <> io.cmd
-  io.resp.valid     := controller.io.cmd_resp_valid_out
-  io.resp.bits.rd   := controller.io.cmd_resp_rd_out
-  io.resp.bits.data := controller.io.cmd_resp_data_out
-  io.busy           := controller.io.busy_out
-  io.interrupt      := false.B
+  // RoCC FSM states
+  val sIdle :: sWaitOFMRead :: sRespond :: Nil = Enum(3)
+  val rocc_state = RegInit(sIdle)
 
-  // CNNController <-> SimpleDMAController
-  dma.io.dma_req <> controller.io.dma_req_out
-  controller.io.dma_busy_in  := dma.io.busy
-  controller.io.dma_done_in  := dma.io.done
-  controller.io.dma_error_in := dma.io.error
+  // Registers for RoCC interaction
+  val resp_data_reg = Reg(UInt(config.xLen.W))
+  val resp_rd_reg = Reg(UInt(5.W))
+  val resp_valid_reg = RegInit(false.B)
 
-  // --- SimpleDMAController <-> RoCC Memory Interface (io.mem: HellaCacheIO) ---
+  val accelerator_status_reg = RegInit(STATUS_IDLE) // For GET_STATUS command
+  val ofm_read_addr_reg = Reg(UInt(config.ofmAddrWidth.W)) // For CMD_GET_OFM_ADDR_DATA
 
-  io.mem.req.valid := dma.io.mem_req.valid
-  dma.io.mem_req.ready := io.mem.req.ready
+  // Default outputs for RoCC interface
+  io.cmd.ready := (rocc_state === sIdle) && !resp_valid_reg
+  io.resp.valid := resp_valid_reg
+  io.resp.bits.rd := resp_rd_reg
+  io.resp.bits.data := resp_data_reg
+  io.busy := (compute_unit.io.busy || accelerator_status_reg === STATUS_COMPUTING) && (rocc_state =/= sIdle)
+  io.interrupt := false.B // No interrupts for this simple version
 
-  io.mem.req.bits.addr    := dma.io.mem_req.bits.addr
-  io.mem.req.bits.cmd     := Mux(dma.io.mem_req.bits.isWrite, M_XWR, M_XRD) // M_XWR and M_XRD should be in scope now
-  io.mem.req.bits.size    := dma.io.mem_req.bits.size
-  io.mem.req.bits.signed  := false.B
-  io.mem.req.bits.data    := dma.io.mem_req.bits.data
-  io.mem.req.bits.phys    := true.B
-  io.mem.req.bits.no_alloc:= false.B
-  io.mem.req.bits.no_xcpt := false.B
-  io.mem.req.bits.tag     := 0.U
+  // Default connections for buffer write ports (controlled by RoCC FSM)
+  ifm_buffer.io.write_en := false.B
+  ifm_buffer.io.write_addr := 0.U
+  ifm_buffer.io.write_data := 0.U
+  // ifm_buffer.io.read_addr is driven by compute_unit
 
-  // Mask: HellaCacheReq requires a mask. DMA transfers full beats.
-  // config.tileLinkBeatBytes is an Int
-  io.mem.req.bits.mask    := Fill(config.tileLinkBeatBytes, 1.U(1.W))
+  kernel_buffer.io.write_en := false.B
+  kernel_buffer.io.write_addr := 0.U
+  kernel_buffer.io.write_data := 0.U
+  // kernel_buffer.io.read_addr is driven by compute_unit
 
-  // dprv (privilege mode) and dv (data virtual address)
-  // PRV should be in scope from HasCoreParameters (via CSRs)
-  io.mem.req.bits.dprv    := PRV.M.U // Example: Machine mode. Adjust if necessary (e.g. PRV.S or PRV.U)
-                                     // PRV.SZ is also available for width casting if needed, but 0.U works for U/S/M modes.
-  io.mem.req.bits.dv      := false.B // Assuming physical addresses
+  // OFM buffer connections
+  ofm_buffer.io.write_en := compute_unit.io.ofm_write_en // CU writes to OFM
+  ofm_buffer.io.write_addr := compute_unit.io.ofm_write_addr
+  ofm_buffer.io.write_data := compute_unit.io.ofm_write_data
+  ofm_buffer.io.read_addr := 0.U // Controlled by RoCC FSM for readback via CMD_GET_OFM_ADDR_DATA
 
-  // idx (cache index for virtual address aliasing) - DMA uses physical addresses
-  // usingVM, untagBits, pgIdxBits should be in scope from HasCoreParameters
-  io.mem.req.bits.idx.foreach(_ := 0.U) // Assign to idx if it exists (is Some). Default to 0.U for physical addrs.
+  // Default connections for compute_unit inputs (controlled by RoCC FSM or wired below)
+  compute_unit.io.start := false.B
+  // compute_unit.io.ifm_read_addr is an OUTPUT of compute_unit
+  // compute_unit.io.ifm_read_data is an INPUT to compute_unit, connected below
+  // compute_unit.io.kernel_read_addr is an OUTPUT of compute_unit
+  // compute_unit.io.kernel_read_data is an INPUT to compute_unit, connected below
 
-  io.mem.req.bits.no_resp := false.B // DMA controller expects a response
+  // RoCC Command Handling FSM
+  when(resp_valid_reg && io.resp.ready) {
+    resp_valid_reg := false.B // Clear response valid when CPU accepts it
+  }
 
-  // Connect RoCC's HellaCache memory response to DMA's memory response
-  dma.io.mem_resp.valid     := io.mem.resp.valid
-  dma.io.mem_resp.bits.data := io.mem.resp.bits.data
+  switch(rocc_state) {
+    is(sIdle) {
+      accelerator_status_reg := Mux(compute_unit.io.busy, STATUS_COMPUTING,
+                                Mux(compute_unit.io.done && accelerator_status_reg === STATUS_COMPUTING, STATUS_COMPUTE_DONE, // Latch if was computing
+                                    Mux(accelerator_status_reg === STATUS_COMPUTE_DONE, STATUS_COMPUTE_DONE, STATUS_IDLE))) // Hold done or idle
 
-  // --- SimpleDMAController <-> Scratchpad Connections ---
-  spad.io.ifm_write.en   := dma.io.spad_ifm_wen
-  spad.io.ifm_write.addr := dma.io.spad_ifm_addr
-  spad.io.ifm_write.data := dma.io.spad_ifm_data_in
+      when(io.cmd.valid && !resp_valid_reg) {
+        val cmd = io.cmd.bits
+        resp_rd_reg := cmd.inst.rd // Capture destination register for all commands
 
-  spad.io.kernel_write.en   := dma.io.spad_kernel_wen
-  spad.io.kernel_write.addr := dma.io.spad_kernel_addr
-  spad.io.kernel_write.data := dma.io.spad_kernel_data_in
+        io.cmd.ready := false.B // Will be set back to true if cmd processed in one cycle
 
-  // Use .fire (Bool signal) not .fire() (Scala method)
-  val latched_dma_is_write_to_main_mem = RegEnable(controller.io.dma_req_out.bits.is_write_to_main_mem, controller.io.dma_req_out.fire)
-  spad.io.ofm_read.en   := dma.io.busy && latched_dma_is_write_to_main_mem
+        switch(cmd.inst.funct) {
+          is(CMD_SET_IFM_ADDR_DATA) {
+            when(cmd.rs1 < config.ifmDepth.U) {
+              ifm_buffer.io.write_en   := true.B
+              ifm_buffer.io.write_addr := cmd.rs1
+              ifm_buffer.io.write_data := cmd.rs2(config.dataWidth - 1, 0)
+              accelerator_status_reg := STATUS_LOADING_IFM
+            } .otherwise {
+              accelerator_status_reg := STATUS_ERROR
+            }
+            io.cmd.ready := true.B
+          }
+          is(CMD_SET_KERNEL_ADDR_DATA) {
+            when(cmd.rs1 < config.kernelDepth.U) {
+              kernel_buffer.io.write_en   := true.B
+              kernel_buffer.io.write_addr := cmd.rs1
+              kernel_buffer.io.write_data := cmd.rs2(config.dataWidth - 1, 0)
+              accelerator_status_reg := STATUS_LOADING_KERNEL
+            } .otherwise {
+              accelerator_status_reg := STATUS_ERROR
+            }
+            io.cmd.ready := true.B
+          }
+          is(CMD_START_COMPUTE) {
+            when(!compute_unit.io.busy && accelerator_status_reg =/= STATUS_COMPUTING) { // ensure not already busy
+              compute_unit.io.start := true.B
+              accelerator_status_reg := STATUS_COMPUTING
+            }
+            io.cmd.ready := true.B
+          }
+          is(CMD_GET_OFM_ADDR_DATA) {
+            when(cmd.rs1 < config.ofmDepth.U) {
+              ofm_buffer.io.read_addr := cmd.rs1
+              ofm_read_addr_reg := cmd.rs1 // Save for data fetch next cycle
+              rocc_state := sWaitOFMRead
+            } .otherwise {
+              resp_data_reg := STATUS_ERROR.asUInt
+              resp_valid_reg := true.B
+              accelerator_status_reg := STATUS_ERROR
+              rocc_state := sRespond // Go to respond to send error
+            }
+          }
+          is(CMD_GET_STATUS) {
+            // Status is updated at the beginning of sIdle or when compute_unit.io.done fires.
+            // Here we just read the latched status.
+            resp_data_reg := accelerator_status_reg
+            resp_valid_reg := true.B
+            rocc_state := sRespond // Go to respond state
+          }
+        }
+      }
+    }
 
-  spad.io.ofm_read.addr := dma.io.spad_ofm_addr
-  dma.io.spad_ofm_data_out := spad.io.ofm_read.data
+    is(sWaitOFMRead) {
+      // Data from ofm_buffer.io.read_data is valid in this cycle
+      resp_data_reg := ofm_buffer.io.read_data
+      resp_valid_reg := true.B
+      rocc_state := sRespond
+    }
 
-  // ComputeUnit <-> Scratchpad Connections
-  spad.io.ifm_read.en   := compute_unit.io.ifm_read_req.en
-  spad.io.ifm_read.addr := compute_unit.io.ifm_read_req.addr
-  compute_unit.io.ifm_read_req.data := spad.io.ifm_read.data
+    is(sRespond) {
+      // Wait for resp_valid_reg to be cleared by CPU io.resp.ready
+      when(!resp_valid_reg) {
+        io.cmd.ready := true.B
+        rocc_state := sIdle
+      }
+    }
+  }
 
-  spad.io.kernel_read.en   := compute_unit.io.kernel_read_req.en
-  spad.io.kernel_read.addr := compute_unit.io.kernel_read_req.addr
-  compute_unit.io.kernel_read_req.data := spad.io.kernel_read.data
+  // Connect Compute Unit to Buffers
+  // Buffers provide data to CU (input to CU)
+  compute_unit.io.ifm_read_data    := ifm_buffer.io.read_data
+  compute_unit.io.kernel_read_data := kernel_buffer.io.read_data
 
-  spad.io.ofm_write.en   := compute_unit.io.ofm_write_req.en
-  spad.io.ofm_write.addr := compute_unit.io.ofm_write_req.addr
-  spad.io.ofm_write.data := compute_unit.io.ofm_write_req.data
+  // CU drives its own read addresses to the buffers (output from CU)
+  ifm_buffer.io.read_addr    := compute_unit.io.ifm_read_addr
+  kernel_buffer.io.read_addr := compute_unit.io.kernel_read_addr
 
-  // CNNController <-> ComputeUnit Connections
-  compute_unit.io.start            := controller.io.compute_start_out
-  compute_unit.io.kernel_dim       := controller.io.compute_kernel_dim_out
-  controller.io.compute_busy_in    := compute_unit.io.busy
-  controller.io.compute_done_in    := compute_unit.io.done
-  controller.io.compute_error_in   := compute_unit.io.error
+  // When compute unit is done, and RoCC was in computing state, update RoCC's status
+  when(compute_unit.io.done && accelerator_status_reg === STATUS_COMPUTING) {
+      accelerator_status_reg := STATUS_COMPUTE_DONE
+  }
 }

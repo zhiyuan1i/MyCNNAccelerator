@@ -2,44 +2,40 @@
 package mycnnaccelerators
 
 import chisel3._
+import chisel3.util.log2Ceil
 
-// Define data type configurations
-sealed trait DataTypeConfig {
-  def dataWidth: Int
-}
-case class FixedPointConfig(dataWidth: Int, fractionBits: Int) extends DataTypeConfig
-// Example: case class FloatConfig(dataWidth: Int, expWidth: Int, sigWidth: Int) extends DataTypeConfig
-
+// Basic Accelerator Configuration
 case class AcceleratorConfig(
-  // Data types
-  ifmDataType: FixedPointConfig = FixedPointConfig(dataWidth = 16, fractionBits = 8),
-  kernelDataType: FixedPointConfig = FixedPointConfig(dataWidth = 16, fractionBits = 8),
-  ofmDataType: FixedPointConfig = FixedPointConfig(dataWidth = 16, fractionBits = 8),
-  accumulatorWidth: Int = 32,
+  // Data width for IFM, Kernel, OFM elements
+  dataWidth: Int = 8,
 
-  // Buffer sizes (number of elements)
-  ifmDepth: Int = 32 * 32,
-  kernelMaxDepth: Int = 5 * 5,
-  ofmDepth: Int = 32 * 32,
+  // IFM Dimensions (fixed)
+  ifmRows: Int = 8, // Example: Small IFM
+  ifmCols: Int = 8,
 
-  // Fixed dimensions
-  ifmRows: Int = 32,
-  ifmCols: Int = 32,
-  kernelMaxRows: Int = 5,
-  kernelMaxCols: Int = 5,
-  ofmRows: Int = 32,
-  ofmCols: Int = 32,
+  // Kernel Dimensions (fixed)
+  kernelRows: Int = 3, // Example: 3x3 Kernel
+  kernelCols: Int = 3,
 
-  // DMA parameters
-  coreMaxAddrBits: Int = 64,
-  tileLinkBeatBytes: Int = 8,
+  // RoCC Core's xLen (register width, e.g., 64 bits)
+  // This will be updated by the RoCC wrapper from the core's parameters.
+  xLen: Int = 64 // Default, will be overridden
+) {
+  // Derived parameters
+  val ifmDepth: Int = ifmRows * ifmCols
+  val kernelDepth: Int = kernelRows * kernelCols
 
-  // Core xLen (processor register width, e.g., 32 or 64)
-  // This will be populated by the RoCC wrapper from the core's parameters.
-  xLen: Int = 64 // Default value, will be overridden
-)
+  // OFM Dimensions (calculated for 'valid' convolution)
+  val ofmRows: Int = ifmRows - kernelRows + 1
+  val ofmCols: Int = ifmCols - kernelCols + 1
+  val ofmDepth: Int = ofmRows * ofmCols
 
-// Default configuration object
-// Note: The xLen here is a placeholder if DefaultAcceleratorConfig is used directly
-// without being processed by MyCNNRoCC to inject the actual core xLen.
+  // Address widths for buffers
+  val ifmAddrWidth: Int = log2Ceil(ifmDepth)
+  val kernelAddrWidth: Int = log2Ceil(kernelDepth)
+  val ofmAddrWidth: Int = log2Ceil(ofmDepth)
+}
+
+// Default configuration object, xLen is a placeholder here.
+// MyCNNRoCC will create the actual config with the correct xLen.
 object DefaultAcceleratorConfig extends AcceleratorConfig()

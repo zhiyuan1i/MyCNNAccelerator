@@ -5,201 +5,149 @@ import chisel3._
 import chisel3.util._
 
 class ComputeUnitIO(val config: AcceleratorConfig) extends Bundle {
-  val start = Input(Bool()) // Start computation signal from CNNController
-  val busy  = Output(Bool()) // Accelerator is busy computing
-  val done  = Output(Bool())  // Computation finished successfully
-  val error = Output(Bool()) // Error during computation (e.g., overflow if checked)
+  val start = Input(Bool())
+  val busy  = Output(Bool())
+  val done  = Output(Bool())
 
-  // Configuration for the current convolution
-  val kernel_dim = Input(UInt(log2Ceil(config.kernelMaxRows + 1).W)) // K (e.g., 3 for 3x3, 5 for 5x5)
-  // Stride is assumed to be 1. Padding is calculated to maintain OFM size = IFM size.
+  // IFM Buffer Interface (CU reads from IFM buffer)
+  val ifm_read_addr = Output(UInt(config.ifmAddrWidth.W))
+  val ifm_read_data = Input(UInt(config.dataWidth.W)) // Data from IFM buffer
 
-  // Scratchpad Read Interfaces (ComputeUnit requests data)
-  val ifm_read_req    = Output(new ScratchpadReadIO(log2Ceil(config.ifmDepth), config.ifmDataType.dataWidth))
-  val kernel_read_req = Output(new ScratchpadReadIO(log2Ceil(config.kernelMaxDepth), config.kernelDataType.dataWidth))
+  // Kernel Buffer Interface (CU reads from Kernel buffer)
+  val kernel_read_addr = Output(UInt(config.kernelAddrWidth.W))
+  val kernel_read_data = Input(UInt(config.dataWidth.W)) // Data from Kernel buffer
 
-  // Scratchpad Write Interface (ComputeUnit writes OFM data)
-  val ofm_write_req   = Output(new ScratchpadWriteIO(log2Ceil(config.ofmDepth), config.ofmDataType.dataWidth))
+  // OFM Buffer Interface (CU writes to OFM buffer)
+  val ofm_write_en   = Output(Bool())
+  val ofm_write_addr = Output(UInt(config.ofmAddrWidth.W))
+  val ofm_write_data = Output(UInt(config.dataWidth.W))
 }
 
 class ComputeUnit(val config: AcceleratorConfig) extends Module {
   val io = IO(new ComputeUnitIO(config))
 
-  // Define States for the FSM
-  val sIdle :: sSetup :: sCalcOFMRow :: sCalcOFMCol_NewElement :: sReqIFMKernel :: sWaitForData :: sMAC :: sWriteOFM :: sDone :: sErrorState :: Nil = Enum(10)
+  // States for the Compute Unit FSM
+  val sIdle :: sFetchIFM :: sFetchKernel :: sMAC :: sWriteOFM :: sDoneCU :: Nil = Enum(6)
   val state = RegInit(sIdle)
 
-  // Registers for loop counters, configuration, and accumulator
-  val K = Reg(UInt(log2Ceil(config.kernelMaxRows + 1).W)) // Current kernel dimension (e.g., 3 or 5)
-  val padding = Reg(UInt(log2Ceil(config.kernelMaxRows).W)) // Calculated padding, e.g., (K-1)/2
+  // Registers for loop counters and data
+  val ofm_row = RegInit(0.U(log2Ceil(config.ofmRows).W))
+  val ofm_col = RegInit(0.U(log2Ceil(config.ofmCols).W))
 
-  val ofm_row_idx = RegInit(0.U(log2Ceil(config.ofmRows).W))
-  val ofm_col_idx = RegInit(0.U(log2Ceil(config.ofmCols).W))
-  val k_row_idx   = RegInit(0.U(log2Ceil(config.kernelMaxRows).W))
-  val k_col_idx   = RegInit(0.U(log2Ceil(config.kernelMaxCols).W))
+  val k_row = RegInit(0.U(log2Ceil(config.kernelRows).W))
+  val k_col = RegInit(0.U(log2Ceil(config.kernelCols).W))
 
-  // Accumulator, using SInt for signed fixed-point arithmetic
-  val accumulator = RegInit(0.S(config.accumulatorWidth.W))
+  // Accumulator - make it wider to prevent overflow during MAC
+  val accWidth = config.dataWidth * 2 + log2Ceil(config.kernelRows * config.kernelCols)
+  val accumulator = RegInit(0.S(accWidth.W)) // Signed for potential future use, works for UInt too
 
-  // Registers to hold data read from scratchpad (due to SyncReadMem latency)
-  val ifm_data_reg   = Reg(UInt(config.ifmDataType.dataWidth.W))
-  val kernel_data_reg = Reg(UInt(config.kernelDataType.dataWidth.W))
-  val ifm_val_is_zero_padding = Reg(Bool()) // True if the current IFM value should be from zero padding
-
+  // Registers to hold data read from buffers (due to SyncReadMem 1-cycle latency)
+  val ifm_data_reg   = Reg(UInt(config.dataWidth.W))
+  val kernel_data_reg = Reg(UInt(config.dataWidth.W))
+  val data_fetch_cycle = RegInit(false.B) // To manage 2-cycle read
 
   // Default outputs
-  io.busy  := (state =/= sIdle) && (state =/= sDone) && (state =/= sErrorState)
-  io.done  := (state === sDone)
-  io.error := (state === sErrorState)
+  io.busy := (state =/= sIdle) && (state =/= sDoneCU)
+  io.done := (state === sDoneCU)
 
-  io.ifm_read_req.en     := false.B
-  io.ifm_read_req.addr   := 0.U
-  io.kernel_read_req.en  := false.B
-  io.kernel_read_req.addr:= 0.U
-  io.ofm_write_req.en    := false.B
-  io.ofm_write_req.addr  := 0.U
-  io.ofm_write_req.data  := accumulator.asUInt // Truncate/saturate if accumulatorWidth > ofmDataType.dataWidth
+  io.ifm_read_addr := 0.U
+  io.kernel_read_addr := 0.U
 
-  // Fixed-point arithmetic helper functions (assuming Q point is config.ifmDataType.fractionBits)
-  // These are placeholders. Proper fixed-point libraries or more detailed implementations are needed for accuracy.
-  def fixed_mul(a: SInt, b: SInt): SInt = {
-    // (a * b) >> fractionBits. For Q8.8 * Q8.8 = Q16.16, then shift right by 8 to get Q16.8
-    // Ensure intermediate multiplication doesn't overflow before shift
-    val product =Wire(SInt((a.getWidth + b.getWidth).W))
-    product := a * b
-    (product >> config.ifmDataType.fractionBits).asSInt // Assuming IFM, Kernel, OFM have same fractionBits
-  }
-
-  def fixed_add(a: SInt, b: SInt): SInt = {
-    a + b
-  }
-
+  io.ofm_write_en   := false.B
+  io.ofm_write_addr := 0.U
+  io.ofm_write_data := accumulator(config.dataWidth - 1, 0).asUInt // Truncate/saturate as needed
 
   switch(state) {
     is(sIdle) {
       when(io.start) {
-        state := sSetup
-      }
-    }
-    is(sSetup) {
-      K             := io.kernel_dim
-      padding       := (io.kernel_dim - 1.U) / 2.U // (K-1)/2 for 'same' convolution with stride 1
-      ofm_row_idx   := 0.U
-      ofm_col_idx   := 0.U
-      state         := sCalcOFMRow
-    }
-
-    is(sCalcOFMRow) { // Iterate over OFM rows
-      when(ofm_row_idx < config.ofmRows.U) {
-        ofm_col_idx := 0.U
-        state       := sCalcOFMCol_NewElement
-      } .otherwise {
-        state := sDone // All OFM rows processed
+        ofm_row := 0.U
+        ofm_col := 0.U
+        k_row   := 0.U
+        k_col   := 0.U
+        accumulator := 0.S
+        state := sFetchIFM
+        data_fetch_cycle := false.B // Start fetch cycle 0 (addressing)
       }
     }
 
-    is(sCalcOFMCol_NewElement) { // Iterate over OFM columns, start new OFM element
-      when(ofm_col_idx < config.ofmCols.U) {
-        accumulator := 0.S          // Reset accumulator for new OFM element
-        k_row_idx   := 0.U          // Reset kernel row counter
-        k_col_idx   := 0.U          // Reset kernel col counter
-        state       := sReqIFMKernel // Start MAC loop for this OFM element
-      } .otherwise { // Current OFM row done
-        ofm_row_idx := ofm_row_idx + 1.U
-        state       := sCalcOFMRow // Move to next OFM row
+    is(sFetchIFM) {
+      // Cycle 0: Assert address for IFM data
+      // Cycle 1: Latch data, assert address for Kernel data
+      when(!data_fetch_cycle) { // Cycle 0
+        val current_ifm_row = ofm_row + k_row
+        val current_ifm_col = ofm_col + k_col
+        io.ifm_read_addr := current_ifm_row * config.ifmCols.U + current_ifm_col
+        data_fetch_cycle := true.B
+        // Stay in sFetchIFM for next cycle to latch data
+      } .otherwise { // Cycle 1
+        ifm_data_reg := io.ifm_read_data // Latch IFM data from previous cycle's address
+        state := sFetchKernel
+        data_fetch_cycle := false.B // Reset for kernel fetch
       }
     }
 
-    is(sReqIFMKernel) { // Request IFM and Kernel data for current MAC operation
-      // Calculate IFM coordinates (accounting for padding)
-      // Zext: zero-extend to signed. SInt for comparison with padding.
-      val ifm_eff_row = ofm_row_idx.zext + k_row_idx.zext - padding.zext
-      val ifm_eff_col = ofm_col_idx.zext + k_col_idx.zext - padding.zext
-
-      // Check if the required IFM element is within bounds (not padding)
-      val is_padding_access = ifm_eff_row < 0.S || ifm_eff_row >= config.ifmRows.S ||
-                              ifm_eff_col < 0.S || ifm_eff_col >= config.ifmCols.S
-
-      ifm_val_is_zero_padding := is_padding_access
-
-      when(!is_padding_access) {
-        io.ifm_read_req.en   := true.B
-        io.ifm_read_req.addr := ifm_eff_row.asUInt * config.ifmCols.U + ifm_eff_col.asUInt // Linear address
-      } .otherwise {
-        io.ifm_read_req.en   := false.B // Don't read if padding
+    is(sFetchKernel) {
+      // Cycle 0: Assert address for Kernel data
+      // Cycle 1: Latch data, proceed to MAC
+      when(!data_fetch_cycle) { // Cycle 0
+        io.kernel_read_addr := k_row * config.kernelCols.U + k_col
+        data_fetch_cycle := true.B
+      } .otherwise { // Cycle 1
+        kernel_data_reg := io.kernel_read_data // Latch Kernel data
+        state := sMAC
+        data_fetch_cycle := false.B
       }
-
-      // Request Kernel data
-      io.kernel_read_req.en  := true.B
-      io.kernel_read_req.addr:= k_row_idx * K + k_col_idx // Linear address for kernel
-
-      state := sWaitForData // Next state: wait for SyncReadMem data
     }
 
-    is(sWaitForData) {
-      // Data from IFM (if not padding) and Kernel will be available on respective *.data ports THIS cycle
-      // because the read was asserted in the PREVIOUS cycle (sReqIFMKernel).
-      // We capture them into registers.
-      // The actual io.ifm_read_req.data is used directly in MyCNNRoCC to connect to SPAD output.
-      // Here, ComputeUnit expects the connected data to be valid.
-      ifm_data_reg    := io.ifm_read_req.data // This is actually SPAD output connected to CU input
-      kernel_data_reg := io.kernel_read_req.data // This is actually SPAD output connected to CU input
+    is(sMAC) {
+      accumulator := accumulator + (ifm_data_reg.zext * kernel_data_reg.zext).asSInt
 
-      // De-assert read enables for next cycle unless specifically needed
-      io.ifm_read_req.en   := false.B
-      io.kernel_read_req.en  := false.B
-      state := sMAC
-    }
-
-    is(sMAC) { // Perform Multiply-Accumulate
-      val current_ifm_val_sint = Mux(ifm_val_is_zero_padding,
-                                     0.S(config.ifmDataType.dataWidth.W),
-                                     ifm_data_reg.asSInt)
-      val current_kernel_val_sint = kernel_data_reg.asSInt
-
-      accumulator := fixed_add(accumulator, fixed_mul(current_ifm_val_sint, current_kernel_val_sint))
-
-      // Increment kernel column
-      k_col_idx := k_col_idx + 1.U
-      when(k_col_idx + 1.U === K) { // Current kernel row finished
-        k_col_idx := 0.U
-        k_row_idx := k_row_idx + 1.U
-        when(k_row_idx + 1.U === K) { // All kernel elements processed for this OFM
-          state := sWriteOFM
-        } .otherwise { // Next kernel row
-          state := sReqIFMKernel
+      // Increment kernel iterators
+      k_col := k_col + 1.U
+      when(k_col + 1.U === config.kernelCols.U) {
+        k_col := 0.U
+        k_row := k_row + 1.U
+        when(k_row + 1.U === config.kernelRows.U) {
+          k_row := 0.U
+          state := sWriteOFM // All kernel elements processed for this OFM pixel
+        } .otherwise {
+          state := sFetchIFM // Next row in kernel
         }
-      } .otherwise { // Next kernel column
-        state := sReqIFMKernel
+      } .otherwise {
+        state := sFetchIFM // Next col in kernel
       }
     }
 
-    is(sWriteOFM) { // Write accumulated OFM element to Scratchpad
-      io.ofm_write_req.en   := true.B
-      io.ofm_write_req.addr := ofm_row_idx * config.ofmCols.U + ofm_col_idx
-      // Data conversion: accumulator (SInt) to OFM data type (UInt)
-      // This needs proper handling of fixed-point format (saturation, truncation/rounding)
-      // For simplicity, direct cast, assuming ofmDataType.dataWidth can hold the relevant part.
-      val result_to_write = Wire(SInt(config.ofmDataType.dataWidth.W))
-      // Example: if accumulator is Q16.16 and OFM is Q8.8, shift and truncate.
-      // This depends on your exact fixed-point representation.
-      // Assuming accumulator is already in the correct fixed point format for OFM, just possibly wider.
-      // Taking lower bits for simplicity:
-      result_to_write := accumulator(config.ofmDataType.dataWidth - 1, 0).asSInt
-      io.ofm_write_req.data := result_to_write.asUInt
+    is(sWriteOFM) {
+      io.ofm_write_en   := true.B
+      io.ofm_write_addr := ofm_row * config.ofmCols.U + ofm_col
+      // Data is set by default connection. Ensure accumulator is appropriately sized and truncated.
 
-      // Next OFM element
-      ofm_col_idx := ofm_col_idx + 1.U
-      state       := sCalcOFMCol_NewElement // Go to process next OFM col or next OFM row
+      accumulator := 0.S // Reset accumulator for next OFM element
+
+      // Increment OFM iterators
+      ofm_col := ofm_col + 1.U
+      when(ofm_col + 1.U === config.ofmCols.U) {
+        ofm_col := 0.U
+        ofm_row := ofm_row + 1.U
+        when(ofm_row + 1.U === config.ofmRows.U) {
+          state := sDoneCU // All OFM pixels computed
+        } .otherwise {
+          k_row := 0.U // Reset kernel iterators for new OFM element
+          k_col := 0.U
+          state := sFetchIFM // Next row in OFM
+        }
+      } .otherwise {
+        k_row := 0.U // Reset kernel iterators for new OFM element
+        k_col := 0.U
+        state := sFetchIFM // Next col in OFM
+      }
     }
 
-    is(sDone) {
-      when(!io.start) { // Wait for start to go low before returning to Idle (optional debounce)
+    is(sDoneCU) {
+      when(!io.start) { // Optional: wait for start to de-assert before idling
         state := sIdle
       }
-    }
-    is(sErrorState) {
-      // Stay here until reset or a specific clear command (not implemented)
     }
   }
 }

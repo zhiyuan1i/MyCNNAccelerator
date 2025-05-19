@@ -2,27 +2,23 @@
 package mycnnaccelerators
 
 import chisel3._
-import chisel3.util.log2Ceil
 
 object CNNAcceleratorISA {
-  // Funct values for RoCC custom instructions (ensure unique within your RoCC opcode space)
-  // Assuming a 7-bit funct field as in the original snippet
-  val CONFIG_IFM_ADDR           = 0.U(7.W)
-  val CONFIG_KERNEL_ADDR_SIZE   = 1.U(7.W) // rs1: addr, rs2: kernel_dim (e.g., 3 for 3x3, 5 for 5x5)
-  val CONFIG_OFM_ADDR_PARAMS  = 2.U(7.W) // rs1: addr, rs2: other params if needed (e.g., stride, padding type)
-  val START_CONVOLUTION         = 3.U(7.W) // No operands needed if configured prior
-  val GET_STATUS                = 4.U(7.W) // Returns status code in rd
+  // Funct values for RoCC custom instructions (7-bit)
+  // rs1 generally for address, rs2 for data (if applicable)
+  // rd generally for response data (if applicable)
 
-  // Status codes returned by GET_STATUS (example values)
-  // Ensure these fit within the data width of rd (typically xLen)
-  // Using 8 bits for status as in the original
-  val STATUS_IDLE               = 0.U(8.W)
-  val STATUS_BUSY_DMA_IFM       = 1.U(8.W)
-  val STATUS_BUSY_DMA_KERNEL    = 2.U(8.W)
-  val STATUS_BUSY_COMPUTE       = 3.U(8.W)
-  val STATUS_BUSY_DMA_OFM       = 4.U(8.W)
-  val STATUS_DONE_SUCCESS       = 100.U(8.W)
-  val STATUS_ERROR_DMA          = 200.U(8.W) // General DMA error
-  val STATUS_ERROR_CONFIG       = 201.U(8.W) // Configuration error (e.g., start before full config)
-  val STATUS_ERROR_COMPUTE      = 202.U(8.W) // Error during computation (e.g., overflow if detected)
+  val CMD_SET_IFM_ADDR_DATA   = 0.U(7.W) // rs1: address in IFM buffer, rs2: data
+  val CMD_SET_KERNEL_ADDR_DATA= 1.U(7.W) // rs1: address in Kernel buffer, rs2: data
+  val CMD_START_COMPUTE       = 2.U(7.W) // No operands needed if data is pre-loaded
+  val CMD_GET_OFM_ADDR_DATA   = 3.U(7.W) // rs1: address in OFM buffer, rd: data from OFM
+  val CMD_GET_STATUS          = 4.U(7.W) // rd: status code
+
+  // Status codes (ensure fits in xLen, typically 8-bits are plenty)
+  val STATUS_IDLE             = 0.U(8.W)
+  val STATUS_LOADING_IFM      = 1.U(8.W) // Optional: if we want finer grain status
+  val STATUS_LOADING_KERNEL   = 2.U(8.W) // Optional
+  val STATUS_COMPUTING        = 3.U(8.W)
+  val STATUS_COMPUTE_DONE     = 4.U(8.W) // Computation finished, OFM is ready
+  val STATUS_ERROR            = 255.U(8.W) // General error
 }
