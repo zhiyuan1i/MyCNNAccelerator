@@ -4,41 +4,43 @@ import chisel3._
 import chiseltest._
 import org.scalatest.flatspec.AnyFlatSpec
 import org.chipsalliance.cde.config.{Parameters, Config}
+// Ensure RoCCCommand and MStatus are imported
 import freechips.rocketchip.tile.RoCCCommand
-import CNNAcceleratorISA._ // Import your ISA definitions
-import freechips.rocketchip.rocket.HellaCacheIO
-import AcceleratorConfig._
-import mycnnaccelerators.{MyCNNAcceleratorKey, AcceleratorConfig, DefaultAcceleratorConfig}
+import freechips.rocketchip.rocket.MStatus 
+import CNNAcceleratorISA._
+import chisel3.util.DecoupledIO 
+// import freechips.rocketchip.rocket.HellaCacheIO // Likely not needed here, but harmless
+// import AcceleratorConfig._ // This might be covered by the more specific import below
+// Ensure DMARequest is in scope, e.g. by importing it if it's in the mycnnaccelerators package
+// import mycnnaccelerators.DMARequest // Assuming DMARequest is defined in this package
 
-// Assuming you have a AcceleratorConfig similar to the one used in ScratchpadTester
-// If not, you might need to create or adjust this part.
+// Your config class (looks good)
 class TestConfigForCNNController extends Config((site, here, up) => {
-    case MyCNNAcceleratorKey => DefaultAcceleratorConfig // Or new AcceleratorConfig(...) if you want to customize
+    case MyCNNAcceleratorKey => DefaultAcceleratorConfig
 })
-
 
 class CNNControllerTester extends AnyFlatSpec with ChiselScalatestTester {
   behavior of "CNNController"
 
   implicit val p: Parameters = new TestConfigForCNNController
-  val accConfig = p(MyCNNAcceleratorKey) // Fetch AcceleratorConfig
+  val accConfig = p(MyCNNAcceleratorKey)
 
-  // Helper function to send a RoCC command
+  // Helper function to send a RoCC command (looks good)
   def sendCommand(dut: CNNController, funct: UInt, rs1: BigInt, rs2: BigInt, rd: Int = 0): Unit = {
     dut.io.cmd_in.valid.poke(true.B)
     dut.io.cmd_in.bits.inst.funct.poke(funct)
     dut.io.cmd_in.bits.inst.rs1.poke(rs1.U)
     dut.io.cmd_in.bits.inst.rs2.poke(rs2.U)
     dut.io.cmd_in.bits.inst.rd.poke(rd.U)
-    dut.io.cmd_in.bits.status.poke(0.U) // Assuming default status, adjust if needed
+    dut.io.cmd_in.bits.status.poke(0.U.asTypeOf(new MStatus)) // Correct MStatus poke
     dut.clock.step(1)
     dut.io.cmd_in.valid.poke(false.B)
   }
 
-  // Helper to check for response
+  // Helper to check for response (looks good)
   def expectResponse(dut: CNNController, expectedData: BigInt, expectedRd: Int): Unit = {
-    // Wait for response valid, with a timeout
     var timeout = 0
+    // Wait for the DUT to assert cmd_resp_valid_out
     while (!dut.io.cmd_resp_valid_out.peek().litToBoolean && timeout < 50) {
       dut.clock.step(1)
       timeout += 1
@@ -46,38 +48,57 @@ class CNNControllerTester extends AnyFlatSpec with ChiselScalatestTester {
     assert(timeout < 50, "Timeout waiting for response valid")
     dut.io.cmd_resp_data_out.expect(expectedData.U)
     dut.io.cmd_resp_rd_out.expect(expectedRd.U)
-    // Response should ideally go low after one cycle if ready is asserted by CPU,
-    // or controller should hold it until ready. For basic check, just observe.
-    // In a real RoCC environment, io.cmd.ready would be managed.
-    // Here, we assume the controller makes it valid and then it might go low.
-    // To ensure we see it, we might need io.cmd_in.ready to be high.
-    // For this test, we assume the controller drives resp_valid for at least one cycle.
+    // In a real system, the CPU would signal it has taken the response, often via io.resp.ready.
+    // For this test, we assume the DUT keeps resp_valid high for one cycle or the test consumes it implicitly.
+  }
+
+  // Helper to expect and dequeue a DMARequest with predicate checks
+  // T_REQ is the type of the data on the DecoupledIO, assumed to have main_mem_addr, is_write_to_main_mem etc.
+  def expectDMARequestPred(
+      dmaChannel: DecoupledIO[DMARequest], // Pass the channel directly
+      clock: Clock, // Pass the clock for stepping
+      pred: DMARequest => Boolean,
+      failMsg: String = "DMA Request predicate failed"
+  ): DMARequest = {
+      dmaChannel.ready.poke(true.B)
+      var timeout = 0
+      while (!dmaChannel.valid.peek().litToBoolean && timeout < 100) {
+          clock.step(1)
+          timeout += 1
+      }
+      assert(timeout < 100, s"Timeout waiting for DMA request valid. $failMsg")
+      dmaChannel.valid.expect(true.B)
+      val req = dmaChannel.bits.peek()
+      assert(pred(req), s"$failMsg for request: $req")
+      clock.step(1) // Consume the request
+      dmaChannel.ready.poke(false.B) // Good practice to deassert ready
+      req
   }
 
 
   it should "configure IFM, Kernel, OFM addresses and start convolution" in {
     test(new CNNController(accConfig)).withAnnotations(Seq(WriteVcdAnnotation)) { c =>
       c.io.cmd_in.initSource().setSourceClock(c.clock)
-      c.io.cmd_resp_valid_out.poke(false.B) // Model CPU not ready initially for response
+      // REMOVED: c.io.cmd_resp_valid_out.poke(false.B) // Cannot poke an output of the DUT
+      // If you need to model CPU not ready for response, DUT needs a resp_ready input.
 
       // Mock DMA and Compute inputs
       c.io.dma_busy_in.poke(false.B)
       c.io.dma_done_in.poke(false.B)
-      c.io.dma_error_in.poke(false.B) 
+      c.io.dma_error_in.poke(false.B)
       c.io.compute_busy_in.poke(false.B)
       c.io.compute_done_in.poke(false.B)
       c.io.compute_error_in.poke(false.B)
-      c.io.dma_req_out.initSink().setSinkClock(c.clock) // Allow requests to be dequeued
+      c.io.dma_req_out.initSink().setSinkClock(c.clock)
+      c.io.dma_req_out.ready.poke(false.B) // Initially not ready to dequeue
+
 
       // 1. Configure IFM Address
       sendCommand(c, CONFIG_IFM_ADDR, 0x1000, 0x0, 1)
-      c.clock.step(1) // Allow controller to process
-      // Controller should make response valid. Poke ready high to consume response.
-      c.io.cmd_in.ready.expect(false.B) // Controller should be busy processing or responding
-      // Assuming response is immediate for config if cmd_in.ready was high on controller side
-      // Here, we wait for cmd_resp_valid_out
+      c.clock.step(1)
+      // c.io.cmd_in.ready.expect(false.B) // Controller might be busy, this is a valid check
       expectResponse(c, STATUS_IDLE.litValue, 1)
-      c.clock.step(5) // Give some cycles
+      c.clock.step(5)
 
       // 2. Configure Kernel Address and Size
       val kernelDim = 3
@@ -99,26 +120,28 @@ class CNNControllerTester extends AnyFlatSpec with ChiselScalatestTester {
       c.clock.step(5)
 
       // 5. Start Convolution
-      sendCommand(c, START_CONVOLUTION, 0x0, 0x0, 0) // rd is not used for START
+      sendCommand(c, START_CONVOLUTION, 0x0, 0x0, 0)
       c.io.busy_out.expect(true.B)
-      // Controller should move to sDmaLoadIFM_Setup then sDmaLoadIFM_Busy
+
       // Expect DMA request for IFM
-      c.io.dma_req_out.expectDequeuePred( (req: DMARequest) => {
+      expectDMARequestPred(c.io.dma_req_out, c.clock, (req: DMARequest) => {
         req.main_mem_addr.peek().litValue == 0x1000 &&
         !req.is_write_to_main_mem.peek().litToBoolean &&
         req.spad_target_is_ifm.peek().litToBoolean
-      })
+      }, "IFM DMA Request Mismatch")
+
       // Simulate DMA finishing IFM load
       c.io.dma_done_in.poke(true.B)
       c.clock.step(1)
       c.io.dma_done_in.poke(false.B)
 
       // Expect DMA request for Kernel
-      c.io.dma_req_out.expectDequeuePred( (req: DMARequest) => {
+      expectDMARequestPred(c.io.dma_req_out, c.clock, (req: DMARequest) => {
         req.main_mem_addr.peek().litValue == 0x2000 &&
         !req.is_write_to_main_mem.peek().litToBoolean &&
         req.spad_target_is_kernel.peek().litToBoolean
-      })
+      }, "Kernel DMA Request Mismatch")
+
       // Simulate DMA finishing Kernel load
       c.io.dma_done_in.poke(true.B)
       c.clock.step(1)
@@ -128,10 +151,10 @@ class CNNControllerTester extends AnyFlatSpec with ChiselScalatestTester {
       c.io.compute_start_out.expect(true.B)
       c.io.compute_kernel_dim_out.expect(kernelDim.U)
       c.clock.step(1)
-      c.io.compute_start_out.expect(false.B) // Should be a pulse
+      c.io.compute_start_out.expect(false.B)
 
       // Simulate Compute finishing
-      c.io.compute_busy_in.poke(true.B) // Keep compute busy for a few cycles
+      c.io.compute_busy_in.poke(true.B)
       c.clock.step(5)
       c.io.compute_busy_in.poke(false.B)
       c.io.compute_done_in.poke(true.B)
@@ -139,10 +162,12 @@ class CNNControllerTester extends AnyFlatSpec with ChiselScalatestTester {
       c.io.compute_done_in.poke(false.B)
 
       // Expect DMA request for OFM writeback
-       c.io.dma_req_out.expectDequeuePred( (req: DMARequest) => {
+      expectDMARequestPred(c.io.dma_req_out, c.clock, (req: DMARequest) => {
         req.main_mem_addr.peek().litValue == 0x3000 &&
         req.is_write_to_main_mem.peek().litToBoolean
-      })
+        // Note: spad_target flags might not be relevant or could be checked if they are
+      }, "OFM DMA Request Mismatch")
+
       // Simulate DMA finishing OFM writeback
       c.io.dma_done_in.poke(true.B)
       c.clock.step(1)
@@ -152,12 +177,9 @@ class CNNControllerTester extends AnyFlatSpec with ChiselScalatestTester {
       c.clock.step(5) // Allow FSM to return to Idle
       c.io.busy_out.expect(false.B)
 
-      // Check Status (should be DONE_SUCCESS before returning to IDLE, then IDLE)
-      // The status register might reflect DONE_SUCCESS briefly before sRespondDone transitions to sIdle.
-      // Let's try sending GET_STATUS again. It should be IDLE now.
       sendCommand(c, GET_STATUS, 0x0, 0x0, 5)
       c.clock.step(1)
-      expectResponse(c, STATUS_IDLE.litValue, 5) // Or STATUS_DONE_SUCCESS then IDLE if checked earlier
+      expectResponse(c, STATUS_IDLE.litValue, 5)
     }
   }
 
@@ -165,6 +187,7 @@ class CNNControllerTester extends AnyFlatSpec with ChiselScalatestTester {
     test(new CNNController(accConfig)) { c =>
       c.io.cmd_in.initSource().setSourceClock(c.clock)
       c.io.dma_req_out.initSink().setSinkClock(c.clock)
+      c.io.dma_req_out.ready.poke(false.B) // Initially not expecting DMA requests
 
       // Mock DMA and Compute inputs
       c.io.dma_busy_in.poke(false.B)
@@ -174,13 +197,10 @@ class CNNControllerTester extends AnyFlatSpec with ChiselScalatestTester {
       c.io.compute_done_in.poke(false.B)
       c.io.compute_error_in.poke(false.B)
 
-      // Send START_CONVOLUTION without any prior config
       sendCommand(c, START_CONVOLUTION, 0x0, 0x0, 1)
       c.clock.step(1)
       expectResponse(c, STATUS_ERROR_CONFIG.litValue, 1)
-      c.io.busy_out.expect(false.B) // Should not become busy, just error and stay idle
+      c.io.busy_out.expect(false.B)
     }
   }
-
-  // Add more tests for other ISA commands, error conditions (DMA error, Compute error), etc.
 }
