@@ -11,7 +11,14 @@ import freechips.rocketchip.rocket.constants.MemoryOpConstants._ // For M_XRD, M
 import org.chipsalliance.cde.config.Config
 import org.chipsalliance.cde.config.Parameters
 
-class TestDMAConfig extends Config(new MyCNNConfig)
+class TestDMAConfig extends Config((site, here, up) => {
+  case MyCNNAcceleratorKey => AcceleratorConfig(
+      // You can override specific parameters here if needed for the test
+      // For example:
+      // ifmDataType = FixedPointConfig(dataWidth = 8, fractionBits = 4),
+      // xLen = 32 // If you need a specific xLen for this test config
+  )
+})
 
 // A very simple behavioral memory model for HellaCacheIO
 class SimpleHellaCacheMemModel(dutIO: HellaCacheIO, clock: Clock, initialMemory: Map[Long, Long] = Map()) {
