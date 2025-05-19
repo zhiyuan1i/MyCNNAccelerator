@@ -16,22 +16,20 @@ class MinimalBufferIO(addrWidth: Int, dataWidth: Int) extends Bundle {
 }
 
 class MinimalBuffer(depth: Int, dataWidth: Int) extends Module {
-  val addrWidth = log2Ceil(depth) // IO 仍然需要地址宽度
+  val addrWidth = log2Ceil(depth) // IO still needs address width
   val io = IO(new MinimalBufferIO(addrWidth, dataWidth))
 
-  // 使用寄存器向量 (Reg of Vec) 来实现存储
-
+  // Use a register vector (Reg of Vec) to implement storage
   val mem_reg = Reg(Vec(depth, SInt(dataWidth.W)))
 
-  // 写操作
+  // Write operation
   when(io.write_en) {
     mem_reg(io.write_addr) := io.write_data
   }
 
-  // 读操作
-  // 为了保持与 SyncReadMem 或 Mem + RegNext 相似的 1 周期读延迟：
-  // mem_reg(io.read_addr) 是对寄存器向量的组合逻辑读
-  // RegNext 会将这个组合逻辑读的结果在下一个周期输出
+  // Read operation
+  // To maintain a 1-cycle read latency similar to SyncReadMem or Mem + RegNext:
+  // mem_reg(io.read_addr) is a combinational read from the register vector
+  // RegNext will output the result of this combinational read in the next cycle
   io.read_data := RegNext(mem_reg(io.read_addr))
-
 }
