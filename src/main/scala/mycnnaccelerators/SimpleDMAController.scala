@@ -3,280 +3,261 @@ package mycnnaccelerators
 
 import chisel3._
 import chisel3.util._
-import freechips.rocketchip.tile.{HasCoreParameters} // Removed TileKey, HasNonDiplomaticTileParameters
-import freechips.rocketchip.rocket.constants.MemoryOpConstants
-import freechips.rocketchip.rocket.HellaCacheIO
-import org.chipsalliance.cde.config.Parameters
+import freechips.rocketchip.rocket.constants.MemoryOpConstants 
 
+// AcceleratorConfig is now defined in AcceleratorConfig.scala
+// Ensure AcceleratorConfig.scala is in the same package or imported correctly.
 
-// DMA request bundle initiated by CNNController
+// --- Simple Memory Interface Bundles (defined in this file) ---
+class DmaSimpleMemReq(val addrWidth: Int, val dataWidth: Int, val beatBytes: Int) extends Bundle {
+  val addr    = UInt(addrWidth.W)
+  val data    = UInt(dataWidth.W)
+  val isWrite = Bool()
+  val size    = UInt(log2Ceil(log2Ceil(beatBytes) + 1).W) // lg(beatBytes)
+}
+
+class DmaSimpleMemResp(val dataWidth: Int) extends Bundle {
+  val data = UInt(dataWidth.W)
+}
+// --- End Simple Memory Interface Bundles ---
+
+// DMA request bundle (remains the same)
 class DMARequest(val coreMaxAddrBits: Int, val spadAddrWidthMax: Int) extends Bundle {
   val main_mem_addr       = UInt(coreMaxAddrBits.W)
-  val spad_base_addr      = UInt(spadAddrWidthMax.W) // Base address for the target SPAD (IFM, Kernel, or OFM starting point)
-  val length_bytes        = UInt(16.W) // Total bytes to transfer
-  val is_write_to_main_mem  = Bool()     // True if reading from SPAD and writing to Main Memory
-  val spad_target_is_ifm    = Bool()     // True if writing to IFM SPAD (main_mem -> IFM)
-  val spad_target_is_kernel = Bool()     // True if writing to Kernel SPAD (main_mem -> Kernel)
-                                        // If is_write_to_main_mem is true, these two are false (OFM -> main_mem)
+  val spad_base_addr      = UInt(spadAddrWidthMax.W)
+  val length_bytes        = UInt(16.W)
+  val is_write_to_main_mem  = Bool()
+  val spad_target_is_ifm    = Bool()
+  val spad_target_is_kernel = Bool()
 }
 
-class SimpleDMAControllerIO(val config: AcceleratorConfig)(implicit p: Parameters) extends Bundle {
-  // Request from CNNController
-  val dma_req = Flipped(Decoupled(new DMARequest(config.coreMaxAddrBits, log2Ceil(config.ifmDepth.max(config.kernelMaxDepth).max(config.ofmDepth)))))
+class SimpleDMAControllerIO(val config: AcceleratorConfig) extends Bundle {
+  val dma_req = Flipped(Decoupled(new DMARequest(config.coreMaxAddrBits, log2Ceil(config.ifmDepth max config.kernelMaxDepth max config.ofmDepth)))) // spadAddrWidthMax derived example
 
-  // Status back to CNNController
-  val busy  = Output(Bool())
+  val mem_req  = Decoupled(new DmaSimpleMemReq(config.coreMaxAddrBits, config.tileLinkBeatBytes * 8, config.tileLinkBeatBytes))
+  val mem_resp = Flipped(Valid(new DmaSimpleMemResp(config.tileLinkBeatBytes * 8)))
+
+  // SPAD interfaces - Address widths need to be sufficient for their respective depths
+  // Example derivation for address widths (adjust as needed for your SPAD implementation)
+  val spad_ifm_addr_width = log2Ceil(config.ifmDepth)
+  val spad_kernel_addr_width = log2Ceil(config.kernelMaxDepth)
+  val spad_ofm_addr_width = log2Ceil(config.ofmDepth)
+
+
+  val spad_ifm_addr    = Output(UInt(spad_ifm_addr_width.W))
+  val spad_ifm_data_in = Output(UInt(config.ifmDataType.dataWidth.W))
+  val spad_ifm_wen     = Output(Bool())
+
+  val spad_kernel_addr    = Output(UInt(spad_kernel_addr_width.W))
+  val spad_kernel_data_in = Output(UInt(config.kernelDataType.dataWidth.W))
+  val spad_kernel_wen     = Output(Bool())
+
+  val spad_ofm_addr     = Output(UInt(spad_ofm_addr_width.W))
+  val spad_ofm_data_out = Input(UInt(config.ofmDataType.dataWidth.W))
+
   val done  = Output(Bool())
   val error = Output(Bool())
-
-  // Interface to RoCC's memory port (HellaCacheIO)
-  val mem = new HellaCacheIO()(p)
-
-  // Scratchpad Write Port
-  val spad_write_en   = Output(Bool())
-  val spad_write_addr = Output(UInt(log2Ceil(config.ifmDepth.max(config.kernelMaxDepth)).W)) // Max for IFM/Kernel
-  val spad_write_data = Output(UInt(config.ifmDataType.dataWidth.max(config.kernelDataType.dataWidth).W))
-
-  // Scratchpad Read Port
-  val spad_read_en    = Output(Bool())
-  // Address width for OFM read or general SPAD read if consolidating address spaces.
-  val spad_read_addr  = Output(UInt(log2Ceil(config.ifmDepth.max(config.kernelMaxDepth).max(config.ofmDepth)).W))
-  // Data width should be max of readable SPAD regions if data paths are shared. Here, OFM is the source for main_mem writes.
-  val spad_read_data  = Input(UInt(config.ofmDataType.dataWidth.max(config.ifmDataType.dataWidth).max(config.kernelDataType.dataWidth).W))
+  val busy  = Output(Bool())
 }
 
+class SimpleDMAController(val config: AcceleratorConfig) extends Module {
+  // Deriving spadAddrWidthMax for internal register, matching DMARequest definition in IO
+  val spadAddrWidthMaxDerived = log2Ceil(config.ifmDepth max config.kernelMaxDepth max config.ofmDepth)
+  val io = IO(new SimpleDMAControllerIO(config))
 
-class SimpleDMAController(val config: AcceleratorConfig)(implicit val p: Parameters) extends Module
-  with HasCoreParameters with MemoryOpConstants {
 
-  val io = IO(new SimpleDMAControllerIO(config)(p))
-
-  val sIdle :: sReqMemReadBeat :: sWaitForMemReadBeatResp :: sWriteElementsToSpad :: sReadElementsFromSpad :: sReqMemWriteBeat :: sWaitForMemWriteBeatResp :: sError :: Nil = Enum(8)
+  val sIdle :: sReadElementsFromSpad :: sWriteBeatToSpad :: sReqMemReadBeat :: sWaitForMemReadBeatData :: sReqMemWriteBeat :: sWaitForMemWriteBeatResp :: sError :: Nil = Enum(8)
   val state = RegInit(sIdle)
 
-  val maxSpadAddrWidth = log2Ceil(config.ifmDepth.max(config.kernelMaxDepth).max(config.ofmDepth))
-  val current_req = Reg(new DMARequest(config.coreMaxAddrBits, maxSpadAddrWidth))
-
-  val total_bytes_to_transfer = Reg(UInt(16.W))
-  val bytes_transferred_total = RegInit(0.U(16.W)) // Total bytes transferred for the current DMARequest
-
-  val current_main_mem_addr_for_beat = Reg(UInt(config.coreMaxAddrBits.W)) // Beat-aligned address for memory op
-  val current_spad_addr_element_wise = Reg(UInt(maxSpadAddrWidth.W)) // Element-wise address for SPAD op
-
-  val spad_element_idx_in_beat = RegInit(0.U(log2Ceil(config.tileLinkBeatBytes + 1).W)) // Tracks elements within the current beat
-
-  // Buffer to hold one beat of data from/to main memory
-  val beat_buffer = Reg(UInt((config.tileLinkBeatBytes * 8).W))
-
-  // Determine properties based on current_req
-  val bytes_per_spad_element = Wire(UInt(8.W))
-
-  when(current_req.is_write_to_main_mem) { // Reading from OFM SPAD
-    bytes_per_spad_element := (config.ofmDataType.dataWidth / 8).U
-  } .elsewhen(current_req.spad_target_is_ifm) { // Writing to IFM SPAD
-    bytes_per_spad_element := (config.ifmDataType.dataWidth / 8).U
-  } .elsewhen(current_req.spad_target_is_kernel) { // Writing to Kernel SPAD
-    bytes_per_spad_element := (config.kernelDataType.dataWidth / 8).U
-  } .otherwise { // Default case
-    bytes_per_spad_element := (config.ifmDataType.dataWidth / 8).U // Default to IFM
-  }
-
-  val elements_per_beat = config.tileLinkBeatBytes.U / bytes_per_spad_element
-  require(config.tileLinkBeatBytes > 0, "tileLinkBeatBytes must be greater than 0")
-  // Ensure bytes_per_spad_element is not zero before division if it can be dynamically zero.
-  // For fixed configs, this should be fine.
+  val current_dma_req              = Reg(new DMARequest(config.coreMaxAddrBits, spadAddrWidthMaxDerived))
+  val beat_buffer                  = Reg(UInt((config.tileLinkBeatBytes * 8).W))
+  val current_main_mem_addr_for_beat = Reg(UInt(config.coreMaxAddrBits.W))
+  val current_spad_addr_for_element = Reg(UInt(spadAddrWidthMaxDerived.W))
+  val bytes_transferred_in_current_beat = Reg(UInt(log2Ceil(config.tileLinkBeatBytes + 1).W))
+  val bytes_transferred_total      = Reg(UInt(io.dma_req.bits.length_bytes.getWidth.W))
+  val total_bytes_to_transfer      = Reg(UInt(io.dma_req.bits.length_bytes.getWidth.W))
 
   // Default outputs
-  io.dma_req.ready := (state === sIdle)
-  io.busy  := (state =/= sIdle) && (state =/= sError)
+  io.dma_req.ready    := false.B
+  io.spad_ifm_wen     := false.B
+  io.spad_ifm_addr    := current_spad_addr_for_element // Connect to the common element address tracker
+  io.spad_ifm_data_in := 0.U
+  io.spad_kernel_wen  := false.B
+  io.spad_kernel_addr := current_spad_addr_for_element // Connect to the common element address tracker
+  io.spad_kernel_data_in := 0.U
+  io.spad_ofm_addr    := current_spad_addr_for_element // Connect to the common element address tracker
+
+  io.mem_req.valid         := false.B
+  io.mem_req.bits.addr     := current_main_mem_addr_for_beat
+  io.mem_req.bits.data     := beat_buffer
+  io.mem_req.bits.isWrite  := false.B
+  io.mem_req.bits.size     := log2Ceil(config.tileLinkBeatBytes).U
+
   io.done  := false.B
-  io.error := (state === sError)
+  io.error := false.B
+  io.busy  := (state =/= sIdle)
 
-  // HellaCacheIO request defaults
-  io.mem.req.valid   := false.B
-  io.mem.req.bits.addr  := current_main_mem_addr_for_beat
-  io.mem.req.bits.tag   := 0.U // Simple DMA, one outstanding request to cache
-  io.mem.req.bits.cmd   := M_XRD
-  io.mem.req.bits.size  := log2Ceil(config.tileLinkBeatBytes).U // Always transfer a full beat
-  io.mem.req.bits.signed := false.B
-  io.mem.req.bits.data  := beat_buffer // For writes
-  io.mem.req.bits.phys  := false.B
-  io.mem.req.bits.no_alloc := false.B
-  io.mem.req.bits.no_xcpt  := false.B
 
-  // Scratchpad connections
-  io.spad_write_en   := false.B
-  io.spad_write_addr := current_req.spad_base_addr + current_spad_addr_element_wise
-  // Data to SPAD comes from beat_buffer, sliced per element
-  val data_to_spad_slice = beat_buffer >> (spad_element_idx_in_beat * bytes_per_spad_element * 8.U)
-
-  // Corrected: Use MuxCase to select the slice using Scala Ints for slice boundaries
-  io.spad_write_data := MuxCase(
-    data_to_spad_slice(config.ifmDataType.dataWidth - 1, 0), // Default if other conditions not met
-    Array(
-      current_req.spad_target_is_ifm    -> data_to_spad_slice(config.ifmDataType.dataWidth - 1, 0),
-      current_req.spad_target_is_kernel -> data_to_spad_slice(config.kernelDataType.dataWidth - 1, 0)
-      // is_write_to_main_mem (false here) means writing to SPAD. Target IFM or Kernel.
-    )
-  )
-
-  io.spad_read_en     := false.B
-  io.spad_read_addr   := current_req.spad_base_addr + current_spad_addr_element_wise
-  // Data from SPAD (io.spad_read_data) is assembled into beat_buffer
-
-  val bytes_remaining_in_req = total_bytes_to_transfer - bytes_transferred_total
-
-  // State Machine Logic
   switch(state) {
     is(sIdle) {
+      io.dma_req.ready := true.B
       when(io.dma_req.valid) {
-        current_req := io.dma_req.bits
-        total_bytes_to_transfer    := io.dma_req.bits.length_bytes
-        bytes_transferred_total    := 0.U
-        current_main_mem_addr_for_beat := io.dma_req.bits.main_mem_addr // Assume start addr is beat-aligned or cache handles it
-        current_spad_addr_element_wise := 0.U // Relative to spad_base_addr
-        spad_element_idx_in_beat   := 0.U
-        io.dma_req.ready          := false.B
+        current_dma_req                := io.dma_req.bits
+        current_main_mem_addr_for_beat := io.dma_req.bits.main_mem_addr
+        current_spad_addr_for_element  := io.dma_req.bits.spad_base_addr // SPAD base address is per element
+        total_bytes_to_transfer        := io.dma_req.bits.length_bytes
+        bytes_transferred_total        := 0.U
+        bytes_transferred_in_current_beat := 0.U
+        beat_buffer                    := 0.U
 
-        when(io.dma_req.bits.length_bytes === 0.U) { // No data to transfer
-            io.done := true.B
-            io.dma_req.ready := true.B
-            state := sIdle
-        }.elsewhen(io.dma_req.bits.is_write_to_main_mem) {
-            state := sReadElementsFromSpad
-        } .otherwise {
-            state := sReqMemReadBeat
-        }
-      }
-    }
-
-    is(sReqMemReadBeat) { // Request to read one beat from Main Memory
-      io.mem.req.valid  := true.B
-      io.mem.req.bits.cmd  := M_XRD
-      // addr and size are already set
-
-      when(io.mem.req.fire) {
-        state := sWaitForMemReadBeatResp
-      }
-    }
-
-    is(sWaitForMemReadBeatResp) { // Waiting for beat from Main Memory
-      when(io.mem.resp.valid) {
-        // Assuming xLen (coreDataBits from HasCoreParameters) == config.tileLinkBeatBytes * 8
-        beat_buffer := io.mem.resp.bits.data // Store the received beat
-        spad_element_idx_in_beat := 0.U      // Reset for processing elements from the new beat
-        state := sWriteElementsToSpad
-      }
-    }
-
-    is(sWriteElementsToSpad) { // Write elements from beat_buffer to Scratchpad
-      val more_elements_in_beat = spad_element_idx_in_beat < elements_per_beat
-      val more_bytes_to_transfer = bytes_transferred_total < total_bytes_to_transfer
-
-      when(more_elements_in_beat && more_bytes_to_transfer) {
-        io.spad_write_en := true.B
-        // spad_write_addr and spad_write_data are connected
-
-        // After this cycle, SPAD write will occur. Update counters for the next element/state.
-        bytes_transferred_total    := bytes_transferred_total + bytes_per_spad_element
-        current_spad_addr_element_wise := current_spad_addr_element_wise + 1.U
-        spad_element_idx_in_beat   := spad_element_idx_in_beat + 1.U
-        state := sWriteElementsToSpad // Stay to write next element from buffer
-      } .otherwise { // Done with current beat or all data transferred
-        when(bytes_transferred_total >= total_bytes_to_transfer) {
+        when(io.dma_req.bits.length_bytes === 0.U) {
           io.done := true.B
-          io.dma_req.ready := true.B
-          state   := sIdle
-        } .otherwise { // More beats to read
-          current_main_mem_addr_for_beat := current_main_mem_addr_for_beat + config.tileLinkBeatBytes.U
+        } .elsewhen(io.dma_req.bits.is_write_to_main_mem) {
+          state := sReadElementsFromSpad
+        } .otherwise {
           state := sReqMemReadBeat
         }
       }
     }
 
-    is(sReadElementsFromSpad) { // Read elements from SPAD to fill beat_buffer
-      val more_elements_to_fill_beat = spad_element_idx_in_beat < elements_per_beat
-      val more_bytes_for_req = bytes_transferred_total < total_bytes_to_transfer
+    is(sReadElementsFromSpad) { // Assemble one beat from OFM SPAD
+      val bytes_per_ofm_element = config.ofmDataType.dataWidth / 8
+      val current_beat_offset_bits = bytes_transferred_in_current_beat << 3
 
-      when(more_elements_to_fill_beat && more_bytes_for_req) {
-        io.spad_read_en := true.B // Assert read enable for current SPAD address
+      io.spad_ofm_addr := current_spad_addr_for_element
 
-        // Corrected: Use MuxCase to select the slice using Scala Ints for slice boundaries
-        val data_from_spad = MuxCase(
-            io.spad_read_data(config.ofmDataType.dataWidth - 1, 0), // Default, should be OFM if is_write_to_main_mem
-            Array(
-                // This state implies current_req.is_write_to_main_mem is true, so data is from OFM SPAD
-                current_req.is_write_to_main_mem  -> io.spad_read_data(config.ofmDataType.dataWidth - 1, 0)
-            )
-        )
+      // This assumes io.spad_ofm_data_out is combinatorially available or latched correctly
+      // LSB of OFM element data goes to LSB of its segment in beat_buffer.
+      // Ensure masking if beat_buffer is wider than needed for this element.
+      beat_buffer := beat_buffer | (io.spad_ofm_data_out.asUInt << current_beat_offset_bits)
 
-        val current_shift = spad_element_idx_in_beat * bytes_per_spad_element * 8.U
+      val next_bytes_in_beat = bytes_transferred_in_current_beat + bytes_per_ofm_element.U
+      val next_total_bytes_overall = bytes_transferred_total + next_bytes_in_beat
 
-        // Corrected: Determine the width of the data being read from SPAD dynamically for mask generation
-        val current_element_data_width_for_mask = Wire(UInt(log2Ceil(config.tileLinkBeatBytes * 8 + 1).W))
-        when(current_req.is_write_to_main_mem) { // Reading from OFM
-            current_element_data_width_for_mask := config.ofmDataType.dataWidth.U
-        } .otherwise {
-            // This case should ideally not be hit if logic is correct for sReadElementsFromSpad state
-            // Defaulting to IFM width as a fallback, but this path needs review if other SPADs can be read from.
-            // For now, this state is entered only when is_write_to_main_mem = true (i.e. reading OFM)
-            current_element_data_width_for_mask := config.ofmDataType.dataWidth.U
-        }
-        // Corrected: Create mask dynamically based on element width
-        val mask = ((1.U << current_element_data_width_for_mask) - 1.U) << current_shift
-
-
-        // Clear the region in beat_buffer and then OR with new data
-        beat_buffer := (beat_buffer & (~mask).asUInt) | (data_from_spad << current_shift)
-
-        // Update counters for the next element to be read from SPAD
-        bytes_transferred_total := bytes_transferred_total + bytes_per_spad_element
-        current_spad_addr_element_wise := current_spad_addr_element_wise + 1.U
-        spad_element_idx_in_beat := spad_element_idx_in_beat + 1.U
-
-        val is_last_element_for_beat_or_req = (spad_element_idx_in_beat + 1.U === elements_per_beat) ||
-                                              (bytes_transferred_total + bytes_per_spad_element >= total_bytes_to_transfer)
-
-        when(is_last_element_for_beat_or_req) {
-          state := sReqMemWriteBeat
-        } .otherwise {
-          state := sReadElementsFromSpad // Stay to read next element into buffer
-        }
-      } .otherwise { // Beat buffer is full or all data is collected
-        when(bytes_transferred_total >= total_bytes_to_transfer && bytes_transferred_total > 0.U) {
-            state := sReqMemWriteBeat
-        } .elsewhen (bytes_transferred_total === 0.U && total_bytes_to_transfer === 0.U) { // Should be caught by sIdle
-            io.done := true.B
-            io.dma_req.ready := true.B
-            state := sIdle
-        } .otherwise {
-            state := sError // Should have data to send or be done
-        }
+      when(next_bytes_in_beat >= config.tileLinkBeatBytes.U || next_total_bytes_overall >= total_bytes_to_transfer) {
+        // Beat is full, or this is the last element for the transfer
+        current_spad_addr_for_element := current_spad_addr_for_element + bytes_per_ofm_element.U // Update for the element just read
+        bytes_transferred_in_current_beat := next_bytes_in_beat // Capture bytes for this beat
+        state := sReqMemWriteBeat
+      } .otherwise {
+        bytes_transferred_in_current_beat := next_bytes_in_beat
+        current_spad_addr_for_element := current_spad_addr_for_element + bytes_per_ofm_element.U
+        state := sReadElementsFromSpad
       }
     }
 
+    is(sWriteBeatToSpad) { // Write one beat from beat_buffer to IFM or Kernel SPAD
+      val shifted_beat_buffer = beat_buffer >> (bytes_transferred_in_current_beat << 3)
+      val data_to_write_spad = Wire(UInt()) // 让 Chisel 推断或稍后连接
 
-    is(sReqMemWriteBeat) { // Request to write one beat (from beat_buffer) to Main Memory
-      io.mem.req.valid := true.B
-      io.mem.req.bits.cmd  := M_XWR
-      io.mem.req.bits.data := beat_buffer
+      // 根据 spad_target 选择正确的宽度 (Scala Int) 和进行提取
+      val ifm_data_width = config.ifmDataType.dataWidth // Scala Int
+      val kernel_data_width = config.kernelDataType.dataWidth // Scala Int
+      val bytes_per_spad_element_write = Wire(UInt((log2Ceil(config.tileLinkBeatBytes) + 1).W)) // 假设最大元素宽度不超过beatBytes
 
-      when(io.mem.req.fire) {
+      when(current_dma_req.spad_target_is_ifm) {
+        data_to_write_spad := shifted_beat_buffer(ifm_data_width - 1, 0)
+        bytes_per_spad_element_write := (ifm_data_width / 8).U
+
+        io.spad_ifm_addr    := current_spad_addr_for_element
+        io.spad_ifm_data_in := data_to_write_spad
+        io.spad_ifm_wen     := true.B
+      } .elsewhen(current_dma_req.spad_target_is_kernel) {
+        data_to_write_spad := shifted_beat_buffer(kernel_data_width - 1, 0)
+        bytes_per_spad_element_write := (kernel_data_width / 8).U
+
+        io.spad_kernel_addr    := current_spad_addr_for_element
+        io.spad_kernel_data_in := data_to_write_spad
+        io.spad_kernel_wen     := true.B
+      } .otherwise {
+        data_to_write_spad := 0.U // Default or error
+        bytes_per_spad_element_write := 0.U
+        state := sError // Invalid SPAD target
+      }
+
+      // 后续逻辑使用 bytes_per_spad_element_write (它现在是一个 UInt Wire，根据条件被赋值)
+      val next_bytes_in_beat = bytes_transferred_in_current_beat + bytes_per_spad_element_write
+
+      val all_bytes_for_this_mem_beat_written_to_spad = next_bytes_in_beat >= config.tileLinkBeatBytes.U
+      // Check if all bytes for the *entire transfer* that came *from this specific memory beat* have been written to SPAD
+      val effective_bytes_from_mem_this_beat = Mux((total_bytes_to_transfer - (bytes_transferred_total - config.tileLinkBeatBytes.U)) < config.tileLinkBeatBytes.U,
+                                                   total_bytes_to_transfer - (bytes_transferred_total - config.tileLinkBeatBytes.U),
+                                                   config.tileLinkBeatBytes.U)
+      val all_relevant_bytes_from_mem_beat_written = next_bytes_in_beat >= effective_bytes_from_mem_beat_processed
+
+      when(all_relevant_bytes_from_mem_beat_written) {
+        current_spad_addr_for_element := current_spad_addr_for_element + bytes_per_spad_element_write // Update for element just written
+        bytes_transferred_in_current_beat := 0.U
+        // beat_buffer cleared before next mem read if needed (or naturally overwritten)
+
+        when(bytes_transferred_total >= total_bytes_to_transfer) {
+          io.done := true.B
+          io.dma_req.ready := true.B
+          state := sIdle
+        } .otherwise {
+          state := sReqMemReadBeat
+        }
+      } .otherwise {
+        bytes_transferred_in_current_beat := next_bytes_in_beat
+        current_spad_addr_for_element := current_spad_addr_for_element + bytes_per_spad_element_write
+        state := sWriteBeatToSpad
+      }
+    }
+
+    is(sReqMemReadBeat) {
+      io.mem_req.valid         := true.B
+      io.mem_req.bits.isWrite  := false.B
+      io.mem_req.bits.addr     := current_main_mem_addr_for_beat
+      io.mem_req.bits.size     := log2Ceil(config.tileLinkBeatBytes).U
+
+      when(io.mem_req.fire) {
+        state := sWaitForMemReadBeatData
+      }
+    }
+
+    is(sWaitForMemReadBeatData) {
+      when(io.mem_resp.valid) {
+        beat_buffer := io.mem_resp.bits.data
+        current_main_mem_addr_for_beat := current_main_mem_addr_for_beat + config.tileLinkBeatBytes.U
+        
+        // Determine actual bytes received relevant to transfer if this is the last beat
+        val bytes_just_read_from_mem = config.tileLinkBeatBytes.U
+        val remaining_bytes = total_bytes_to_transfer - bytes_transferred_total
+        val effective_bytes_this_beat = Mux(remaining_bytes < bytes_just_read_from_mem, remaining_bytes, bytes_just_read_from_mem)
+        
+        bytes_transferred_total := bytes_transferred_total + effective_bytes_this_beat
+        bytes_transferred_in_current_beat := 0.U // Reset for writing this new beat to SPAD
+        state := sWriteBeatToSpad
+      }
+    }
+
+    is(sReqMemWriteBeat) {
+      io.mem_req.valid         := true.B
+      io.mem_req.bits.isWrite  := true.B
+      io.mem_req.bits.addr     := current_main_mem_addr_for_beat
+      io.mem_req.bits.data     := beat_buffer // beat_buffer was filled in sReadElementsFromSpad
+      io.mem_req.bits.size     := log2Ceil(config.tileLinkBeatBytes).U
+
+      when(io.mem_req.fire) {
         state := sWaitForMemWriteBeatResp
       }
     }
 
-    is(sWaitForMemWriteBeatResp) { // Waiting for Main Memory write acknowledgment
-      when(io.mem.resp.valid) { // Write ack received
-        spad_element_idx_in_beat := 0.U // Reset for next beat assembly
+    is(sWaitForMemWriteBeatResp) {
+      when(io.mem_resp.valid) {
+        // bytes_transferred_in_current_beat was the amount assembled into beat_buffer
+        // This amount is what's relevant for the current transfer, even if a full beat was written to mem.
+        bytes_transferred_total := bytes_transferred_total + bytes_transferred_in_current_beat
+        current_main_mem_addr_for_beat := current_main_mem_addr_for_beat + config.tileLinkBeatBytes.U
+        
+        bytes_transferred_in_current_beat := 0.U // Reset for next beat assembly
+        beat_buffer := 0.U // Clear buffer for next assembly
 
         when(bytes_transferred_total >= total_bytes_to_transfer) {
           io.done := true.B
           io.dma_req.ready := true.B
           state   := sIdle
-        } .otherwise { // More beats to write
-          current_main_mem_addr_for_beat := current_main_mem_addr_for_beat + config.tileLinkBeatBytes.U
-          beat_buffer := 0.U // Clear buffer for next assembly
+        } .otherwise {
           state := sReadElementsFromSpad
         }
       }
@@ -284,13 +265,23 @@ class SimpleDMAController(val config: AcceleratorConfig)(implicit val p: Paramet
 
     is(sError) {
       io.error := true.B
-      // Consider if reset to sIdle is desired after error or manual reset needed
+      io.dma_req.ready := true.B // Allow new requests to potentially clear error
+      when(io.dma_req.valid) {
+          state := sIdle // Or a specific reset state
+      }
     }
   }
+  // Helper for SPAD write state, needs to be calculated based on bytes_transferred_total updated after mem read
+  val effective_bytes_from_mem_beat_processed = Wire(UInt(log2Ceil(config.tileLinkBeatBytes + 1).W))
+  val bytes_total_before_this_mem_read = RegNext(bytes_transferred_total, init=0.U) // Capture total before current mem beat was added in sWaitForMemReadBeatData
 
-  // Handle memory exceptions
-  // Corrected: Check s2_xcpt by casting to UInt and checking for non-zero
-  when(io.mem.s2_xcpt.asUInt =/= 0.U) {
-    state := sError
+  when(state === sWriteBeatToSpad) {
+    val bytes_remaining_for_transfer = total_bytes_to_transfer - bytes_total_before_this_mem_read
+    effective_bytes_from_mem_beat_processed := Mux(bytes_remaining_for_transfer < config.tileLinkBeatBytes.U,
+                                                 bytes_remaining_for_transfer,
+                                                 config.tileLinkBeatBytes.U)
+  } .otherwise {
+    effective_bytes_from_mem_beat_processed := config.tileLinkBeatBytes.U // Default or don't care
   }
+
 }

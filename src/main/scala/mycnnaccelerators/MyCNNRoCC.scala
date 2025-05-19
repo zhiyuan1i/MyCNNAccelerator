@@ -2,41 +2,32 @@
 package mycnnaccelerators
 
 import chisel3._
-import chisel3.util._
+import chisel3.util._ // Make sure Mux, Fill, PopCount, etc. are available
 
 import org.chipsalliance.cde.config.{Field, Parameters}
-// Import XLen (Field key) for looking up in Parameters
-import freechips.rocketchip.subsystem.MaxXLen 
-import freechips.rocketchip.tile._
+import freechips.rocketchip.subsystem.MaxXLen
+import freechips.rocketchip.tile._ // Pulls in HasCoreParameters, PRV, etc.
+// M_XWR, M_XRD
 import freechips.rocketchip.diplomacy._
-import freechips.rocketchip.rocket.constants.MemoryOpConstants
+import freechips.rocketchip.rocket._
+// end
+
 
 // Key for accessing the base AcceleratorConfig from the configuration system
 case object MyCNNAcceleratorKey extends Field[AcceleratorConfig](DefaultAcceleratorConfig)
 
 class MyCNNRoCC(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
-  // Fetch the base configuration provided by the system configuration
   val baseConfig = p(MyCNNAcceleratorKey)
-  // Fetch the system's maximum xLen from the parameters using the imported MaxXLen key
-  val systemMaxXLen = p(MaxXLen) // MaxXLen (uppercase) is the Field key
+  val systemMaxXLen = p(MaxXLen)
+  val actualConfig = baseConfig.copy(xLen = systemMaxXLen)
 
-  // Create the final AcceleratorConfig instance to be used, copying base config and injecting the systemMaxXLen
-  // Note: This uses the maximum XLen in the system. If a core-specific XLen is needed and available
-  // via a different key (like the standard freechips.rocketchip.config.XLen), that might be more appropriate.
-  // However, this change addresses the user's direct feedback regarding the import.
-  val actualConfig = baseConfig.copy(xLen = systemMaxXLen) // xLen (lowercase) is the field in AcceleratorConfig
-
-  // Pass the actualConfig (with xLen populated) to the module implementation
   override lazy val module = new MyCNNRoCCModuleImp(this, actualConfig)
 }
 
 class MyCNNRoCCModuleImp(outer: MyCNNRoCC, val config: AcceleratorConfig)(implicit p: Parameters)
-    // LazyRoCCModuleImp already mixes in HasCoreParameters.
-    // We are now making xLen explicitly available via the `config` object.
-    extends LazyRoCCModuleImp(outer) {
+    extends LazyRoCCModuleImp(outer) { // LazyRoCCModuleImp mixes in HasCoreParameters, which brings in MemoryOpConstants, CSRs (for PRV), etc.
 
-  // Instantiate all sub-modules, passing the AcceleratorConfig (which now includes xLen)
-  val controller   = Module(new CNNController(config)) // Pass the config object
+  val controller   = Module(new CNNController(config))
   val dma          = Module(new SimpleDMAController(config))
   val spad         = Module(new Scratchpad(config))
   val compute_unit = Module(new ComputeUnit(config))
@@ -55,24 +46,56 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, val config: AcceleratorConfig)(implic
   controller.io.dma_done_in  := dma.io.done
   controller.io.dma_error_in := dma.io.error
 
-  // SimpleDMAController <-> RoCC Memory Interface
-  dma.io.mem <> io.mem
+  // --- SimpleDMAController <-> RoCC Memory Interface (io.mem: HellaCacheIO) ---
 
-  // SimpleDMAController <-> Scratchpad Connections
-  val dma_is_writing_to_ifm = dma.io.spad_write_en && dma.io.dma_req.bits.spad_target_is_ifm && !dma.io.dma_req.bits.is_write_to_main_mem
-  val dma_is_writing_to_kernel = dma.io.spad_write_en && dma.io.dma_req.bits.spad_target_is_kernel && !dma.io.dma_req.bits.is_write_to_main_mem
+  io.mem.req.valid := dma.io.mem_req.valid
+  dma.io.mem_req.ready := io.mem.req.ready
 
-  spad.io.ifm_write.en   := dma_is_writing_to_ifm
-  spad.io.ifm_write.addr := dma.io.spad_write_addr
-  spad.io.ifm_write.data := dma.io.spad_write_data
+  io.mem.req.bits.addr    := dma.io.mem_req.bits.addr
+  io.mem.req.bits.cmd     := Mux(dma.io.mem_req.bits.isWrite, M_XWR, M_XRD) // M_XWR and M_XRD should be in scope now
+  io.mem.req.bits.size    := dma.io.mem_req.bits.size
+  io.mem.req.bits.signed  := false.B
+  io.mem.req.bits.data    := dma.io.mem_req.bits.data
+  io.mem.req.bits.phys    := true.B
+  io.mem.req.bits.no_alloc:= false.B
+  io.mem.req.bits.no_xcpt := false.B
+  io.mem.req.bits.tag     := 0.U
 
-  spad.io.kernel_write.en   := dma_is_writing_to_kernel
-  spad.io.kernel_write.addr := dma.io.spad_write_addr
-  spad.io.kernel_write.data := dma.io.spad_write_data
+  // Mask: HellaCacheReq requires a mask. DMA transfers full beats.
+  // config.tileLinkBeatBytes is an Int
+  io.mem.req.bits.mask    := Fill(config.tileLinkBeatBytes, 1.U(1.W))
 
-  spad.io.ofm_read.en   := dma.io.spad_read_en && dma.io.dma_req.bits.is_write_to_main_mem
-  spad.io.ofm_read.addr := dma.io.spad_read_addr
-  dma.io.spad_read_data := spad.io.ofm_read.data
+  // dprv (privilege mode) and dv (data virtual address)
+  // PRV should be in scope from HasCoreParameters (via CSRs)
+  io.mem.req.bits.dprv    := PRV.M.U // Example: Machine mode. Adjust if necessary (e.g. PRV.S or PRV.U)
+                                     // PRV.SZ is also available for width casting if needed, but 0.U works for U/S/M modes.
+  io.mem.req.bits.dv      := false.B // Assuming physical addresses
+
+  // idx (cache index for virtual address aliasing) - DMA uses physical addresses
+  // usingVM, untagBits, pgIdxBits should be in scope from HasCoreParameters
+  io.mem.req.bits.idx.foreach(_ := 0.U) // Assign to idx if it exists (is Some). Default to 0.U for physical addrs.
+
+  io.mem.req.bits.no_resp := false.B // DMA controller expects a response
+
+  // Connect RoCC's HellaCache memory response to DMA's memory response
+  dma.io.mem_resp.valid     := io.mem.resp.valid
+  dma.io.mem_resp.bits.data := io.mem.resp.bits.data
+
+  // --- SimpleDMAController <-> Scratchpad Connections ---
+  spad.io.ifm_write.en   := dma.io.spad_ifm_wen
+  spad.io.ifm_write.addr := dma.io.spad_ifm_addr
+  spad.io.ifm_write.data := dma.io.spad_ifm_data_in
+
+  spad.io.kernel_write.en   := dma.io.spad_kernel_wen
+  spad.io.kernel_write.addr := dma.io.spad_kernel_addr
+  spad.io.kernel_write.data := dma.io.spad_kernel_data_in
+
+  // Use .fire (Bool signal) not .fire() (Scala method)
+  val latched_dma_is_write_to_main_mem = RegEnable(controller.io.dma_req_out.bits.is_write_to_main_mem, controller.io.dma_req_out.fire)
+  spad.io.ofm_read.en   := dma.io.busy && latched_dma_is_write_to_main_mem
+
+  spad.io.ofm_read.addr := dma.io.spad_ofm_addr
+  dma.io.spad_ofm_data_out := spad.io.ofm_read.data
 
   // ComputeUnit <-> Scratchpad Connections
   spad.io.ifm_read.en   := compute_unit.io.ifm_read_req.en
