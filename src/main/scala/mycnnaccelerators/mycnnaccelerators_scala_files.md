@@ -1,3 +1,271 @@
+## File: src/main/scala/mycnnaccelerators/MyCNNRoCCModuleImp.scala
+
+```scala
+// filename: MyCNNRoCCModuleImp.scala
+package mycnnaccelerators
+
+import chisel3._
+import chisel3.util._
+import org.chipsalliance.cde.config.Parameters
+import freechips.rocketchip.tile._
+import freechips.rocketchip.rocket.MStatus
+import freechips.rocketchip.rocket.constants.MemoryOpConstants
+import freechips.rocketchip.diplomacy._ // Required for LazyModule
+import CNNAcceleratorISA._
+
+class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(implicit p: Parameters)
+    extends LazyRoCCModuleImp(outer) // outer is MyCNNRoCC
+    with HasCoreParameters { // HasCoreParameters provides xLen, etc.
+
+  val config = defaultConfig.copy(xLen = xLen)
+
+  // Instantiate internal modules
+  val ifm_buffer = Module(new MinimalBuffer(config.ifmDepth, config.dataWidth))
+  val kernel_buffer = Module(new MinimalBuffer(config.kernelDepth, config.dataWidth))
+  val ofm_buffer = Module(new MinimalBuffer(config.ofmDepth, config.dataWidth))
+  val compute_unit = Module(new ComputeUnit(config))
+
+  // Access the module of the DMA engine defined in the outer MyCNNRoCC
+  // This provides the control/status interface for the DMA
+  val dma_ctrl_io = outer.dma_engine_lazy.module.io
+
+  // The RoCC's io.mem is diplomatically connected to the DMA's TileLink node.
+  // No explicit connection like dma_engine.io.mem <> io.mem is needed here.
+
+  // RoCC FSM states
+  val sIdle :: sWaitOFMRead :: sRespond :: sDmaActive :: Nil = Enum(4)
+  val rocc_state = RegInit(sIdle)
+
+  // Registers for RoCC interaction
+  val resp_data_reg = Reg(UInt(config.xLen.W))
+  val resp_rd_reg = Reg(UInt(5.W))
+  val resp_valid_reg = RegInit(false.B)
+
+  // Accelerator status and DMA configuration registers
+  val accelerator_status_reg = RegInit(STATUS_IDLE)
+
+  val dma_mem_base_addr_reg = Reg(UInt(xLen.W)) // xLen should match coreMaxAddrBits for addresses typically
+  val dma_length_bytes_reg = Reg(UInt(dmaConfigLenBits.W))
+  val dma_direction_reg = Reg(UInt(dmaConfigDirBits.W))
+  val dma_buffer_id_reg = Reg(UInt(dmaConfigBufIdBits.W))
+  val dma_configured_flag = RegInit(false.B)
+
+  // Default outputs for RoCC interface
+  io.cmd.ready := (rocc_state === sIdle) && !resp_valid_reg && !dma_ctrl_io.busy
+  io.resp.valid := resp_valid_reg
+  io.resp.bits.rd := resp_rd_reg
+  io.resp.bits.data := resp_data_reg
+  io.busy := (compute_unit.io.busy || dma_ctrl_io.busy || (rocc_state =/= sIdle))
+  io.interrupt := false.B
+
+  // Default connections for buffer write ports (DMA will control these during DMA ops)
+  ifm_buffer.io.write_en := false.B
+  ifm_buffer.io.write_addr := 0.U
+  ifm_buffer.io.write_data := 0.S(config.dataWidth.W)
+
+  kernel_buffer.io.write_en := false.B
+  kernel_buffer.io.write_addr := 0.U
+  kernel_buffer.io.write_data := 0.S(config.dataWidth.W)
+
+  ofm_buffer.io.write_en := compute_unit.io.ofm_write_en // CU writes to OFM
+  ofm_buffer.io.write_addr := compute_unit.io.ofm_write_addr
+  ofm_buffer.io.write_data := compute_unit.io.ofm_write_data
+  ofm_buffer.io.read_addr := 0.U // Controlled by RoCC FSM or DMA
+
+  // Compute unit connections
+  compute_unit.io.start := false.B
+  // ... (rest of compute_unit connections)
+
+  // DMA Engine control inputs (controlled by this FSM)
+  dma_ctrl_io.start := false.B
+  dma_ctrl_io.mem_base_addr := dma_mem_base_addr_reg
+  dma_ctrl_io.length_bytes := dma_length_bytes_reg
+  dma_ctrl_io.directionBits := dma_direction_reg
+  dma_ctrl_io.buffer_id := dma_buffer_id_reg // RoCC tells DMA which conceptual buffer to use
+
+  // RoCC Command Handling FSM
+  when(resp_valid_reg && io.resp.ready) {
+    resp_valid_reg := false.B
+  }
+
+  val dma_addr_configured_internal_flag = RegInit(false.B)
+
+  switch(rocc_state) {
+    is(sIdle) {
+      when(dma_ctrl_io.busy) {
+        accelerator_status_reg := STATUS_DMA_BUSY
+      } .elsewhen(compute_unit.io.busy) {
+        accelerator_status_reg := STATUS_COMPUTING
+      } .elsewhen(accelerator_status_reg === STATUS_DMA_BUSY && dma_ctrl_io.done) { // DMA just finished
+        // Status update upon DMA completion is now handled in sDmaActive state
+        // Here, we transition from DMA_BUSY (set by sDmaActive moving to sIdle) back to IDLE or specific done
+        // This logic path might need refinement depending on how sDmaActive sets status before returning to sIdle
+        accelerator_status_reg := STATUS_IDLE // Placeholder, sDmaActive should set a more specific status
+        dma_configured_flag := false.B
+        dma_addr_configured_internal_flag := false.B
+      } .elsewhen(accelerator_status_reg === STATUS_COMPUTING && compute_unit.io.done) {
+        accelerator_status_reg := STATUS_COMPUTE_DONE
+      } .elsewhen(accelerator_status_reg === STATUS_COMPUTE_DONE ||
+                  accelerator_status_reg === STATUS_DMA_CONFIG_READY ||
+                  accelerator_status_reg === STATUS_DMA_IFM_LOAD_DONE || // Persist DMA done states
+                  accelerator_status_reg === STATUS_DMA_KERNEL_LOAD_DONE ||
+                  accelerator_status_reg === STATUS_DMA_OFM_STORE_DONE ||
+                  accelerator_status_reg === STATUS_DMA_ERROR) {
+        // Persist these states until cleared or new operation starts
+      } .otherwise {
+        when(!dma_configured_flag && !dma_ctrl_io.busy && !compute_unit.io.busy) {
+            accelerator_status_reg := STATUS_IDLE
+        }
+      }
+
+      when(io.cmd.valid && !resp_valid_reg) {
+        val cmd = io.cmd.bits
+        resp_rd_reg := cmd.inst.rd
+
+        switch(cmd.inst.funct) {
+          is(CMD_SET_IFM_ADDR_DATA) { /* ... */ }
+          is(CMD_SET_KERNEL_ADDR_DATA) { /* ... */ }
+          is(CMD_START_COMPUTE) { /* ... */ }
+          is(CMD_GET_OFM_ADDR_DATA) { /* ... */ }
+
+          is(CMD_DMA_CONFIG_ADDR) {
+            dma_mem_base_addr_reg := cmd.rs1
+            dma_addr_configured_internal_flag := true.B
+            dma_configured_flag := false.B
+            accelerator_status_reg := STATUS_IDLE // Or DMA_CONFIG_IN_PROGRESS
+          }
+          is(CMD_DMA_CONFIG_PARAMS) {
+            when(dma_addr_configured_internal_flag) {
+              val param_val = cmd.rs1
+              dma_buffer_id_reg := param_val(dmaConfigBufIdBits - 1, 0)
+              dma_direction_reg := param_val(dmaConfigBufIdBits)
+              dma_length_bytes_reg := param_val(dmaConfigTotalParamBits - 1, dmaConfigBufIdBits + dmaConfigDirBits)
+
+              dma_configured_flag := true.B
+              dma_addr_configured_internal_flag := false.B
+              accelerator_status_reg := STATUS_DMA_CONFIG_READY
+            } .otherwise {
+              accelerator_status_reg := STATUS_DMA_ERROR // Error: PARAMS before ADDR
+            }
+          }
+          is(CMD_DMA_START) {
+            when(dma_configured_flag && !dma_ctrl_io.busy && !compute_unit.io.busy) {
+              dma_ctrl_io.start := true.B // Start the DMA
+              rocc_state := sDmaActive
+              accelerator_status_reg := STATUS_DMA_BUSY
+            } .otherwise {
+              resp_data_reg := STATUS_ERROR.asUInt // Cannot start DMA
+              resp_valid_reg := true.B
+              rocc_state := sRespond
+            }
+          }
+          is(CMD_GET_STATUS) {
+            resp_data_reg := accelerator_status_reg
+            resp_valid_reg := true.B
+            rocc_state := sRespond
+          }
+        }
+      }
+    } // sIdle
+
+    is(sDmaActive) {
+      // Monitor DMA completion or error
+      when(dma_ctrl_io.done) {
+        // Use the RoCC's own registers that configured this DMA operation
+        val completed_op_buffer = dma_buffer_id_reg
+        val completed_op_dir = dma_direction_reg
+
+        when(completed_op_dir === DMADirection.MEM_TO_BUF) {
+          when(completed_op_buffer === BufferIDs.IFM) { accelerator_status_reg := STATUS_DMA_IFM_LOAD_DONE }
+          .elsewhen(completed_op_buffer === BufferIDs.KERNEL) { accelerator_status_reg := STATUS_DMA_KERNEL_LOAD_DONE }
+          .otherwise { accelerator_status_reg := STATUS_DMA_ERROR }
+        } .elsewhen (completed_op_dir === DMADirection.BUF_TO_MEM) {
+          when(completed_op_buffer === BufferIDs.OFM) { accelerator_status_reg := STATUS_DMA_OFM_STORE_DONE }
+          .otherwise { accelerator_status_reg := STATUS_DMA_ERROR }
+        } .otherwise {
+          accelerator_status_reg := STATUS_DMA_ERROR
+        }
+        dma_configured_flag := false.B // Ready for new DMA config
+        dma_addr_configured_internal_flag := false.B
+        rocc_state := sIdle
+      } .elsewhen(dma_ctrl_io.dma_error) {
+        accelerator_status_reg := STATUS_DMA_ERROR
+        dma_configured_flag := false.B
+        dma_addr_configured_internal_flag := false.B
+        rocc_state := sIdle // Or a persistent error state
+      }
+      // else, remain in sDmaActive, dma_ctrl_io.start remains asserted by default (false)
+      // dma_ctrl_io.start should be de-asserted once DMA is seen to be busy or done
+      // This is typically handled by the DMA itself (latches start) or by de-asserting start in the next cycle.
+      // For now, assuming DMA latches start. If not, dma_ctrl_io.start := false.B would be needed here.
+    }
+
+    is(sWaitOFMRead) { /* ... */ }
+    is(sRespond) {
+      when(!resp_valid_reg) { // Response has been taken by CPU
+        rocc_state := sIdle
+      }
+    }
+  }
+
+  // Placeholder for DMA to Buffer Muxing (Part 2)
+  // Example:
+  // when(dma_ctrl_io.spad_write_en && dma_ctrl_io.buffer_id === BufferIDs.IFM) { // buffer_id here is from DMA's perspective if it outputs it
+  // IFM buffer's write port might be driven by dma_ctrl_io.spad_write_...
+  // }
+  // For now, DMA directly controls its spad outputs based on its internal buffer_id input.
+  // The RoCC needs to connect these spad signals to the correct buffer.
+  // E.g. ifm_buffer.io.write_en := dma_ctrl_io.spad_write_en && (dma_buffer_id_reg === BufferIDs.IFM) && (dma_direction_reg === DMADirection.MEM_TO_BUF)
+  // And dma_ctrl_io.spad_read_data needs to be fed from the correct buffer.
+  // This part requires careful muxing based on dma_buffer_id_reg and dma_direction_reg.
+
+  // Connect Compute Unit to Buffers
+  compute_unit.io.ifm_read_data   := ifm_buffer.io.read_data
+  compute_unit.io.kernel_read_data := kernel_buffer.io.read_data
+  ifm_buffer.io.read_addr      := compute_unit.io.ifm_read_addr
+  kernel_buffer.io.read_addr   := compute_unit.io.kernel_read_addr
+
+  when(compute_unit.io.done && (accelerator_status_reg === STATUS_COMPUTING || accelerator_status_reg === STATUS_DMA_KERNEL_LOAD_DONE || accelerator_status_reg === STATUS_DMA_IFM_LOAD_DONE) ) {
+    accelerator_status_reg := STATUS_COMPUTE_DONE
+  }
+
+  // TODO: Mux DMA spad interface to/from ifm, kernel, ofm buffers
+  // This is a simplified example, actual muxing depends on DMA engine's spad signals
+  // and how buffer_id is used by the DMA engine. Assuming DMA drives spad_write_data
+  // and expects spad_read_data based on its configured operation.
+
+  val spad_write_target_is_ifm = dma_buffer_id_reg === BufferIDs.IFM && dma_direction_reg === DMADirection.MEM_TO_BUF
+  val spad_write_target_is_kernel = dma_buffer_id_reg === BufferIDs.KERNEL && dma_direction_reg === DMADirection.MEM_TO_BUF
+
+  ifm_buffer.io.write_en := dma_ctrl_io.spad_write_en && spad_write_target_is_ifm
+  ifm_buffer.io.write_addr := dma_ctrl_io.spad_write_addr // Assuming DMA addr is local to buffer
+  ifm_buffer.io.write_data := dma_ctrl_io.spad_write_data
+
+  kernel_buffer.io.write_en := dma_ctrl_io.spad_write_en && spad_write_target_is_kernel
+  kernel_buffer.io.write_addr := dma_ctrl_io.spad_write_addr // Assuming DMA addr is local to buffer
+  kernel_buffer.io.write_data := dma_ctrl_io.spad_write_data
+
+  // For DMA reading from OFM buffer and writing to memory
+  val spad_read_source_is_ofm = dma_buffer_id_reg === BufferIDs.OFM && dma_direction_reg === DMADirection.BUF_TO_MEM
+
+  // DMA engine requests read from a specific buffer, RoCC provides data from that buffer
+  // Assuming dma_ctrl_io.spad_read_addr is the address for the selected OFM buffer
+  when(spad_read_source_is_ofm) {
+    ofm_buffer.io.read_addr := dma_ctrl_io.spad_read_addr
+    dma_ctrl_io.spad_read_data := ofm_buffer.io.read_data
+  } .otherwise {
+    // Default: if DMA is not reading OFM, or for other buffers if DMA also reads from IFM/Kernel (not typical for this setup)
+    ofm_buffer.io.read_addr := 0.U // Or driven by CMD_GET_OFM_ADDR_DATA logic if that's still used
+    dma_ctrl_io.spad_read_data := 0.S // Default, prevent latching stale data
+  }
+  // Note: if CMD_GET_OFM_ADDR_DATA is active, it would also drive ofm_buffer.io.read_addr.
+  // An arbiter or careful state management for ofm_buffer.io.read_addr might be needed
+  // if both DMA and RoCC direct commands can read OFM concurrently (not typical).
+  // For now, assume DMA read and direct RoCC OFM read are mutually exclusive.
+
+}
+```
+
 ## File: src/main/scala/mycnnaccelerators/MyCNNRoCC.scala
 
 ```scala
@@ -8,7 +276,9 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 import freechips.rocketchip.tile._
-import freechips.rocketchip.diplomacy.LazyModule
+import freechips.rocketchip.diplomacy._
+// import freechips.rocketchip.tilelink.TLIdentityNode // Not directly needed here with override
+
 import CNNAcceleratorISA._ // Import ISA definitions
 
 // Key for configuration
@@ -16,168 +286,19 @@ case object MyCNNAcceleratorKey extends Field[AcceleratorConfig](DefaultAccelera
 
 class MyCNNRoCC(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
   val baseConfig = p(MyCNNAcceleratorKey) // Get base config from Parameters
-  // Actual config is created in MyCNNRoCCModuleImp once xLen is known
+
+  // Instantiate the DMA LazyModule.
+  // The AcceleratorConfig might need xLen, which is known in the ModuleImp.
+  // SimpleDMAEngine takes accConfig.
+  val dma_engine_lazy = LazyModule(new SimpleDMAEngine(baseConfig))
+
+  // This RoCC will use the dma_engine_lazy's TileLink node as its primary memory master interface.
+  // Override atlNode from CanHavePTW (mixed into LazyRoCC) or a similar node if defined by LazyRoCC.
+  // This effectively makes the DMA the RoCC's connection to the memory system via TileLink.
+  override val atlNode = dma_engine_lazy.node
+
+  // The actual config with correct xLen is created in MyCNNRoCCModuleImp
   override lazy val module = new MyCNNRoCCModuleImp(this, baseConfig)
-}
-
-class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(implicit p: Parameters)
-    extends LazyRoCCModuleImp(outer)
-    with HasCoreParameters { // HasCoreParameters provides xLen, etc.
-
-  // Create the actual config using xLen from HasCoreParameters
-  val config = defaultConfig.copy(xLen = xLen)
-
-  // Instantiate internal modules
-  val ifm_buffer = Module(new MinimalBuffer(config.ifmDepth, config.dataWidth))
-  val kernel_buffer = Module(new MinimalBuffer(config.kernelDepth, config.dataWidth))
-  val ofm_buffer = Module(new MinimalBuffer(config.ofmDepth, config.dataWidth))
-  val compute_unit = Module(new ComputeUnit(config))
-
-  // RoCC FSM states
-  val sIdle :: sWaitOFMRead :: sRespond :: Nil = Enum(3)
-  val rocc_state = RegInit(sIdle)
-
-  // Registers for RoCC interaction
-  val resp_data_reg = Reg(UInt(config.xLen.W))
-  val resp_rd_reg = Reg(UInt(5.W))
-  val resp_valid_reg = RegInit(false.B)
-
-  val accelerator_status_reg = RegInit(STATUS_IDLE) // For GET_STATUS command
-  val ofm_read_addr_reg = Reg(UInt(config.ofmAddrWidth.W)) // For CMD_GET_OFM_ADDR_DATA
-
-  // Default outputs for RoCC interface
-  io.cmd.ready := (rocc_state === sIdle) && !resp_valid_reg
-  io.resp.valid := resp_valid_reg
-  io.resp.bits.rd := resp_rd_reg
-  io.resp.bits.data := resp_data_reg
-  io.busy := (compute_unit.io.busy || accelerator_status_reg === STATUS_COMPUTING) && (rocc_state =/= sIdle) // Simplified busy logic for now
-  io.interrupt := false.B // No interrupts for this simple version
-
-  // Default connections for buffer write ports (controlled by RoCC FSM)
-  ifm_buffer.io.write_en := false.B
-  ifm_buffer.io.write_addr := 0.U
-  ifm_buffer.io.write_data := 0.S(config.dataWidth.W) // CORRECTED: SInt literal
-  // ifm_buffer.io.read_addr is driven by compute_unit
-
-  kernel_buffer.io.write_en := false.B
-  kernel_buffer.io.write_addr := 0.U
-  kernel_buffer.io.write_data := 0.S(config.dataWidth.W) // CORRECTED: SInt literal
-  // kernel_buffer.io.read_addr is driven by compute_unit
-
-  // OFM buffer connections
-  ofm_buffer.io.write_en := compute_unit.io.ofm_write_en // CU writes to OFM
-  ofm_buffer.io.write_addr := compute_unit.io.ofm_write_addr
-  ofm_buffer.io.write_data := compute_unit.io.ofm_write_data // SInt to SInt (OK)
-  ofm_buffer.io.read_addr := 0.U // Controlled by RoCC FSM for readback via CMD_GET_OFM_ADDR_DATA
-
-  // Default connections for compute_unit inputs (controlled by RoCC FSM or wired below)
-  compute_unit.io.start := false.B
-  // compute_unit.io.ifm_read_addr is an OUTPUT of compute_unit
-  // compute_unit.io.ifm_read_data is an INPUT to compute_unit, connected below
-  // compute_unit.io.kernel_read_addr is an OUTPUT of compute_unit
-  // compute_unit.io.kernel_read_data is an INPUT to compute_unit, connected below
-
-  // RoCC Command Handling FSM
-  when(resp_valid_reg && io.resp.ready) {
-    resp_valid_reg := false.B // Clear response valid when CPU accepts it
-  }
-
-  switch(rocc_state) {
-    is(sIdle) {
-      accelerator_status_reg := Mux(compute_unit.io.busy, STATUS_COMPUTING,
-                                Mux(compute_unit.io.done && accelerator_status_reg === STATUS_COMPUTING, STATUS_COMPUTE_DONE,
-                                    Mux(accelerator_status_reg === STATUS_COMPUTE_DONE, STATUS_COMPUTE_DONE, STATUS_IDLE)))
-
-      when(io.cmd.valid && !resp_valid_reg) {
-        val cmd = io.cmd.bits
-        resp_rd_reg := cmd.inst.rd // Capture destination register for all commands
-
-        io.cmd.ready := false.B // Will be set back to true if cmd processed in one cycle
-
-        switch(cmd.inst.funct) {
-          is(CMD_SET_IFM_ADDR_DATA) {
-            when(cmd.rs1 < config.ifmDepth.U) {
-              ifm_buffer.io.write_en   := true.B
-              ifm_buffer.io.write_addr := cmd.rs1
-              ifm_buffer.io.write_data := cmd.rs2(config.dataWidth - 1, 0).asSInt // CORRECTED: Cast to SInt
-              accelerator_status_reg := STATUS_LOADING_IFM
-            } .otherwise {
-              accelerator_status_reg := STATUS_ERROR
-            }
-            io.cmd.ready := true.B
-          }
-          is(CMD_SET_KERNEL_ADDR_DATA) {
-            when(cmd.rs1 < config.kernelDepth.U) {
-              kernel_buffer.io.write_en   := true.B
-              kernel_buffer.io.write_addr := cmd.rs1
-              kernel_buffer.io.write_data := cmd.rs2(config.dataWidth - 1, 0).asSInt // CORRECTED: Cast to SInt
-              accelerator_status_reg := STATUS_LOADING_KERNEL
-            } .otherwise {
-              accelerator_status_reg := STATUS_ERROR
-            }
-            io.cmd.ready := true.B
-          }
-          is(CMD_START_COMPUTE) {
-            when(!compute_unit.io.busy && accelerator_status_reg =/= STATUS_COMPUTING) { // ensure not already busy
-              compute_unit.io.start := true.B
-              accelerator_status_reg := STATUS_COMPUTING
-            }
-            io.cmd.ready := true.B
-          }
-          is(CMD_GET_OFM_ADDR_DATA) {
-            when(cmd.rs1 < config.ofmDepth.U) {
-              ofm_buffer.io.read_addr := cmd.rs1
-              // ofm_read_addr_reg := cmd.rs1 // Not strictly needed if data is read next cycle directly
-              rocc_state := sWaitOFMRead
-            } .otherwise {
-              resp_data_reg := STATUS_ERROR.asUInt // Ensure STATUS_ERROR can fit or is truncated appropriately
-              resp_valid_reg := true.B
-              accelerator_status_reg := STATUS_ERROR
-              rocc_state := sRespond // Go to respond to send error
-            }
-          }
-          is(CMD_GET_STATUS) {
-            resp_data_reg := accelerator_status_reg // Status reg is already UInt(8.W), will be zero-extended by assignment to UInt(xLen.W)
-            resp_valid_reg := true.B
-            rocc_state := sRespond // Go to respond state
-          }
-        }
-      }
-    }
-
-    is(sWaitOFMRead) {
-      // Data from ofm_buffer.io.read_data is valid in this cycle
-      // CORRECTED: Handle SInt from buffer to UInt RoCC response register with sign extension
-      val data_from_ofm = Wire(SInt(config.xLen.W))
-      data_from_ofm := ofm_buffer.io.read_data // Sign-extends from dataWidth to xLen
-      resp_data_reg := data_from_ofm.asUInt    // Convert to UInt
-
-      resp_valid_reg := true.B
-      rocc_state := sRespond
-    }
-
-    is(sRespond) {
-      // Wait for resp_valid_reg to be cleared by CPU io.resp.ready
-      when(!resp_valid_reg) {
-        io.cmd.ready := true.B
-        rocc_state := sIdle
-      }
-    }
-  }
-
-  // Connect Compute Unit to Buffers
-  // Buffers provide data to CU (input to CU)
-  compute_unit.io.ifm_read_data    := ifm_buffer.io.read_data    // SInt to SInt (OK)
-  compute_unit.io.kernel_read_data := kernel_buffer.io.read_data // SInt to SInt (OK)
-
-  // CU drives its own read addresses to the buffers (output from CU)
-  ifm_buffer.io.read_addr    := compute_unit.io.ifm_read_addr
-  kernel_buffer.io.read_addr := compute_unit.io.kernel_read_addr
-
-  // When compute unit is done, and RoCC was in computing state, update RoCC's status
-  when(compute_unit.io.done && accelerator_status_reg === STATUS_COMPUTING) {
-      accelerator_status_reg := STATUS_COMPUTE_DONE
-  }
 }
 ```
 
@@ -220,9 +341,312 @@ class MinimalBuffer(depth: Int, dataWidth: Int) extends Module {
   // RegNext 会将这个组合逻辑读的结果在下一个周期输出
   io.read_data := RegNext(mem_reg(io.read_addr))
 
-  // 如果允许0周期读延迟（纯组合逻辑读），可以这样写：
-  // io.read_data := mem_reg(io.read_addr)
-  // 但我们之前的目标是模拟 SyncReadMem 的行为（1周期延迟）
+}
+```
+
+## File: src/main/scala/mycnnaccelerators/SimpleDMAEngine.scala
+
+```scala
+// filename: SimpleDMAEngine.scala
+package mycnnaccelerators
+
+import chisel3._
+import chisel3.util._
+
+import org.chipsalliance.cde.config.Parameters
+import freechips.rocketchip.diplomacy._
+import freechips.rocketchip.tilelink._
+import freechips.rocketchip.tile.HasCoreParameters // For coreMaxAddrBits, xLen etc.
+// It's good practice to ensure TileKey is available if p(TileKey) is used,
+// but here we pass coreMaxAddrBits explicitly to the IO bundle.
+// import freechips.rocketchip.tile.TileKey
+
+import CNNAcceleratorISA._
+
+// IO Bundle for the implementation part of the LazyModule
+class SimpleDMATLModuleIO(
+    val config: AcceleratorConfig,
+    val coreMaxAddrBitsParam: Int // Explicitly pass the address width
+)(implicit p: Parameters) extends Bundle {
+  // Control from MyCNNRoCC (or a higher-level controller)
+  val start = Input(Bool())
+  val mem_base_addr = Input(UInt(coreMaxAddrBitsParam.W)) // Use passed width
+  val length_bytes = Input(UInt(CNNAcceleratorISA.dmaConfigLenBits.W))
+  // The following line was causing: type mismatch; found: chisel3.UInt required: chisel3.ActualDirection
+  // This usually means the Chisel compiler is confused, often due to other errors.
+  // The syntax itself is correct. If the error persists after other fixes,
+  // we might try renaming 'direction' or using a literal for the width to isolate.
+  val directionBits = Input(UInt(CNNAcceleratorISA.dmaConfigDirBits.W))
+  
+  val buffer_id = Input(UInt(CNNAcceleratorISA.dmaConfigBufIdBits.W))
+
+  // Status to MyCNNRoCC
+  val busy = Output(Bool())
+  val done = Output(Bool())
+  val dma_error = Output(Bool())
+
+  // Scratchpad (Internal Buffer) Interface - driven by DMA to be connected by RoCC
+  val spad_write_en = Output(Bool())
+  val spad_write_addr = Output(UInt(32.W)) // Generic width, RoCC maps this to buffer
+  val spad_write_data = Output(SInt(config.dataWidth.W))
+
+  val spad_read_addr = Output(UInt(32.W))  // Generic width, RoCC maps this from buffer
+  val spad_read_data = Input(SInt(config.dataWidth.W))
+}
+
+// SimpleDMAEngine as a LazyModule for TileLink integration
+class SimpleDMAEngine(val accConfig: AcceleratorConfig, numOutstandingReqs: Int = 4)(implicit p: Parameters) extends LazyModule {
+  val node = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLClientParameters(
+    name = "simple-dma-engine",
+    sourceId = IdRange(0, numOutstandingReqs),
+    requestFifo = true
+  )))))
+
+  lazy val module = new SimpleDMAEngineModuleImp(this)
+}
+
+class SimpleDMAEngineModuleImp(outer: SimpleDMAEngine)(implicit p: Parameters) extends LazyModuleImp(outer)
+  with HasCoreParameters { // Provides xLen, coreMaxAddrBits, etc.
+
+  // Instantiate the IO, passing the coreMaxAddrBits from HasCoreParameters
+  val io = IO(new SimpleDMATLModuleIO(outer.accConfig, coreMaxAddrBits)(p))
+
+  val (tl, edge) = outer.node.out.head
+
+  val sIdle :: sTLRead_ReqAddr :: sTLRead_WaitData :: sTLRead_WriteToBuf :: sTLWrite_ReadFromBuf :: sTLWrite_ReqAddr :: sTLWrite_WaitAck :: sDone :: sError :: Nil = Enum(9)
+  val state = RegInit(sIdle)
+
+  val mem_base_addr_reg = Reg(UInt(coreMaxAddrBits.W))
+  val length_bytes_reg = Reg(UInt(CNNAcceleratorISA.dmaConfigLenBits.W))
+  val direction_reg = Reg(UInt(CNNAcceleratorISA.dmaConfigDirBits.W))
+  // val buffer_id_reg = Reg(UInt(CNNAcceleratorISA.dmaConfigBufIdBits.W)) // DMA uses io.buffer_id directly
+
+  val bytes_transferred_count = RegInit(0.U(CNNAcceleratorISA.dmaConfigLenBits.W))
+  val current_mem_addr = Reg(UInt(coreMaxAddrBits.W))
+  val current_spad_addr = Reg(UInt(32.W)) // Assuming spad addresses are local to each buffer concept
+
+  val beatBytes = tl.a.bits.data.getWidth / 8
+  // Ensure buffer_elems_per_beat is at least 1, and handle dataWidth being 0 (though unlikely for practical data)
+  val buffer_elems_per_beat = if (outer.accConfig.dataWidth > 0) {
+    val elems = beatBytes * 8 / outer.accConfig.dataWidth
+    if (elems > 0) elems else 1
+  } else {
+    1
+  }
+
+
+  io.busy := (state =/= sIdle) && (state =/= sDone) && (state =/= sError)
+  io.done := (state === sDone)
+  io.dma_error := (state === sError)
+
+  io.spad_write_en := false.B
+  io.spad_write_addr := 0.U // Default, will be current_spad_addr in active states
+  io.spad_write_data := 0.S
+  io.spad_read_addr := 0.U  // Default, will be current_spad_addr in active states
+
+  tl.a.valid := false.B
+  tl.a.bits := DontCare
+  tl.b.ready := true.B
+  tl.c.valid := false.B
+  tl.c.bits := DontCare
+  tl.d.ready := false.B
+  tl.e.valid := false.B
+  tl.e.bits := DontCare
+
+  val mem_data_beat_reg = Reg(UInt((beatBytes * 8).W))
+  val spad_data_to_write_beat_reg = Reg(UInt((beatBytes*8).W)) // For BUF_TO_MEM
+  // val sub_beat_counter = RegInit(0.U(log2Ceil(buffer_elems_per_beat + 1).W)) // May not be needed if writing full beat
+
+  val dma_start_reg = RegNext(io.start, false.B) // Detect rising edge of start
+  val dma_started_this_cycle = io.start && !dma_start_reg
+
+
+  switch(state) {
+    is(sIdle) {
+      when(dma_started_this_cycle) { // Use registered start to avoid re-triggering if start held high
+        mem_base_addr_reg := io.mem_base_addr
+        length_bytes_reg := io.length_bytes
+        direction_reg := io.directionBits
+        // buffer_id_reg := io.buffer_id // Latch buffer_id for the current operation
+        current_mem_addr := io.mem_base_addr
+        current_spad_addr := 0.U
+        bytes_transferred_count := 0.U
+        // sub_beat_counter := 0.U // Reset if used
+        mem_data_beat_reg := 0.U
+
+        when(io.length_bytes === 0.U) {
+          state := sDone
+        } .elsewhen(io.directionBits === DMADirection.MEM_TO_BUF) {
+          state := sTLRead_ReqAddr
+        } .elsewhen(io.directionBits === DMADirection.BUF_TO_MEM) {
+          state := sTLWrite_ReadFromBuf // Enable write path
+        } .otherwise {
+          state := sError
+        }
+      }
+    }
+
+    is(sTLRead_ReqAddr) {
+      val (legal, get) = edge.Get(
+        fromSource = 0.U, // Manage source IDs for multiple outstanding requests
+        toAddress = current_mem_addr,
+        lgSize = log2Ceil(beatBytes).U
+      )
+      when(legal) {
+        tl.a.valid := true.B
+        tl.a.bits := get
+        when(tl.a.ready) {
+          state := sTLRead_WaitData
+        }
+      } .otherwise {
+        state := sError
+      }
+    }
+
+    is(sTLRead_WaitData) {
+      tl.d.ready := true.B
+      when(tl.d.fire) {
+        when(tl.d.bits.denied || tl.d.bits.corrupt) {
+            state := sError
+        } .otherwise {
+            mem_data_beat_reg := tl.d.bits.data
+            state := sTLRead_WriteToBuf
+        }
+      }
+    }
+
+    is(sTLRead_WriteToBuf) {
+      // Simplified: write one beat from mem_data_beat_reg to spad.
+      // Assumes dataWidth matches beatBytes*8 or RoCC handles sub-beat packing/unpacking.
+      // For now, let's assume RoCC handles data element extraction from spad_write_data
+      // if spad_write_data is wider than one element. Or DMA does packing if spad_write_data is one element.
+      // The current SimpleDMATLModuleIO has spad_write_data as config.dataWidth.
+      // This implies the DMA engine must break down the 'mem_data_beat_reg' (beatBytes*8 wide)
+      // into 'config.dataWidth' chunks and write them sequentially to SPAD.
+      // This adds complexity with a sub_beat_counter.
+      // For simplicity, let's assume config.dataWidth IS beatBytes*8 for this example,
+      // or that spad_write_data is a Vec.
+      // Given current io.spad_write_data is SInt(config.dataWidth.W), DMA must iterate.
+      // This part is not fully implemented here for brevity.
+      // A common simplification: spad_write_data is beat-wide, RoCC unpacks.
+      // Or, this state iterates for each element within the beat.
+      // For now, we'll pretend one write is one element of config.dataWidth, and advance spad_addr by 1 element.
+      // And assume beatBytes is one element. THIS IS A MAJOR SIMPLIFICATION.
+
+      io.spad_write_en := true.B
+      io.spad_write_addr := current_spad_addr
+      // This assignment is problematic if beatBytes*8 != config.dataWidth
+      // For now, taking the LSBs, assuming RoCC will handle it or config matches.
+      io.spad_write_data := mem_data_beat_reg(outer.accConfig.dataWidth - 1, 0).asSInt
+
+      // This state should ideally last for buffer_elems_per_beat cycles if dataWidth < beatBytes*8
+      // current_spad_addr needs to increment per element written.
+      // bytes_transferred_count increments per memory beat.
+
+      // After one "write to buffer" cycle (could be one element or one full beat based on above simplification)
+      val next_spad_addr = current_spad_addr + 1.U // Increment by 1 element address
+      val next_bytes_transferred = bytes_transferred_count + beatBytes.U // One full beat from memory processed
+
+      current_spad_addr := next_spad_addr
+      // current_mem_addr should advance only when a full beat is consumed and a new one is needed.
+      // If we are processing elements within a beat, mem_addr doesn't change yet.
+      // The FSM implies one memory read maps to one spad write cycle.
+      current_mem_addr := current_mem_addr + beatBytes.U
+      bytes_transferred_count := next_bytes_transferred
+
+
+      when(next_bytes_transferred >= length_bytes_reg) {
+        state := sDone
+      } .elsewhen (next_bytes_transferred < length_bytes_reg) {
+        state := sTLRead_ReqAddr // Request next beat
+      } .otherwise { // Should not happen if length_bytes_reg is multiple of beatBytes or handled
+        state := sDone // Or error
+      }
+    }
+
+    is(sTLWrite_ReadFromBuf) {
+        // Read data from SPAD via io.spad_read_data
+        // This state needs to assert io.spad_read_addr
+        io.spad_read_addr := current_spad_addr
+        // Data will be available on io.spad_read_data on the next cycle (combinatorial read from buffer + RegNext in MinimalBuffer)
+        // Or if buffer is sync read, it takes a cycle. Assume MinimalBuffer's RegNext makes it available "next cycle" relative to addr.
+        // For TL Put, we need to prepare data for tl.a.bits.data.
+        // This might require a cycle to read from spad and then a cycle to send.
+
+        // Let's assume data is read and available in the same cycle for simplicity of FSM state count,
+        // or that MyCNNRoCCModuleImp ensures data is ready for spad_read_data when DMA wants it.
+        // A more realistic FSM would have: sTLWrite_SetSpadAddr, sTLWrite_LatchSpadData, then sTLWrite_ReqAddr.
+        // For now, assume io.spad_read_data is valid when this state is entered (after current_spad_addr is set).
+
+        // This simplified FSM will take spad_read_data and directly try to send it.
+        // This again assumes spad_read_data provides a full beatBytes chunk.
+        // If config.dataWidth < beatBytes*8, packing logic is needed here.
+        // Taking LSBs for now.
+        spad_data_to_write_beat_reg := io.spad_read_data.asUInt // Zero-extend if narrower
+
+        state := sTLWrite_ReqAddr
+    }
+
+    is(sTLWrite_ReqAddr) {
+        // Prepare a TileLink PutFullData message (write request)
+        val (legal, put) = edge.Put(
+            fromSource = 0.U,
+            toAddress = current_mem_addr,
+            lgSize = log2Ceil(beatBytes).U,
+            data = spad_data_to_write_beat_reg // Assumes spad_data_to_write_beat_reg is prepared and beatBytes wide
+        )
+        // For PutPartialData: edge.Put(..., mask = ...)
+
+        when(legal) {
+            tl.a.valid := true.B
+            tl.a.bits := put
+            when(tl.a.ready) { // TL slave accepts the request
+                // For PutFullData, data is on channel A. Slave grants on D.
+                state := sTLWrite_WaitAck
+            }
+        } .otherwise {
+            state := sError
+        }
+    }
+
+    is(sTLWrite_WaitAck) {
+        // Wait for Grant/Ack on Channel D
+        tl.d.ready := true.B // We are ready to accept the grant/response
+        when(tl.d.fire) {
+            // Check tl.d.bits.denied or tl.d.bits.corrupt for errors
+            when(tl.d.bits.denied || tl.d.bits.corrupt) { // Check for errors from slave
+                state := sError
+            } .otherwise {
+                // Write successful for this beat
+                val next_spad_addr = current_spad_addr + 1.U // Increment by 1 element address
+                val next_bytes_transferred = bytes_transferred_count + beatBytes.U
+
+                current_spad_addr := next_spad_addr
+                current_mem_addr := current_mem_addr + beatBytes.U
+                bytes_transferred_count := next_bytes_transferred
+
+                when(next_bytes_transferred >= length_bytes_reg) {
+                    state := sDone
+                } .elsewhen (next_bytes_transferred < length_bytes_reg) {
+                    state := sTLWrite_ReadFromBuf // Read next data from SPAD
+                } .otherwise {
+                     state := sDone // Or error
+                }
+            }
+        }
+    }
+
+    is(sDone) {
+      // io.start is a level signal. Wait for it to go low before returning to sIdle,
+      // or ensure controller only pulses start.
+      // If start is kept high, we might immediately re-start.
+      // Using dma_started_this_cycle for sIdle transition handles this.
+      state := sIdle
+    }
+    is(sError) {
+      state := sIdle // Or a persistent error state needing explicit clear
+    }
+  }
 }
 ```
 
@@ -458,23 +882,250 @@ package mycnnaccelerators
 import chisel3._
 
 object CNNAcceleratorISA {
-  // Funct values for RoCC custom instructions (7-bit)
-  // rs1 generally for address, rs2 for data (if applicable)
-  // rd generally for response data (if applicable)
+  // Existing Funct values
+  val CMD_SET_IFM_ADDR_DATA    = 0.U(7.W)
+  val CMD_SET_KERNEL_ADDR_DATA = 1.U(7.W)
+  val CMD_START_COMPUTE        = 2.U(7.W)
+  val CMD_GET_OFM_ADDR_DATA    = 3.U(7.W)
+  val CMD_GET_STATUS           = 4.U(7.W)
 
-  val CMD_SET_IFM_ADDR_DATA   = 0.U(7.W) // rs1: address in IFM buffer, rs2: data
-  val CMD_SET_KERNEL_ADDR_DATA= 1.U(7.W) // rs1: address in Kernel buffer, rs2: data
-  val CMD_START_COMPUTE       = 2.U(7.W) // No operands needed if data is pre-loaded
-  val CMD_GET_OFM_ADDR_DATA   = 3.U(7.W) // rs1: address in OFM buffer, rd: data from OFM
-  val CMD_GET_STATUS          = 4.U(7.W) // rd: status code
+  // New DMA Funct values
+  val CMD_DMA_CONFIG_ADDR      = 5.U(7.W) // rs1: main memory base address
+  val CMD_DMA_CONFIG_PARAMS    = 6.U(7.W) // rs1: Cat(length_in_bytes (24 bits max suggested), direction (1 bit), buffer_id (2 bits))
+  val CMD_DMA_START            = 7.U(7.W) // No operands needed, uses configured values
 
-  // Status codes (ensure fits in xLen, typically 8-bits are plenty)
-  val STATUS_IDLE             = 0.U(8.W)
-  val STATUS_LOADING_IFM      = 1.U(8.W) // Optional: if we want finer grain status
-  val STATUS_LOADING_KERNEL   = 2.U(8.W) // Optional
-  val STATUS_COMPUTING        = 3.U(8.W)
-  val STATUS_COMPUTE_DONE     = 4.U(8.W) // Computation finished, OFM is ready
-  val STATUS_ERROR            = 255.U(8.W) // General error
+  // Existing Status codes
+  val STATUS_IDLE            = 0.U(8.W)
+  val STATUS_LOADING_IFM     = 1.U(8.W) // Will be replaced by DMA status
+  val STATUS_LOADING_KERNEL  = 2.U(8.W) // Will be replaced by DMA status
+  val STATUS_COMPUTING       = 3.U(8.W)
+  val STATUS_COMPUTE_DONE    = 4.U(8.W)
+  // val STATUS_ERROR        = 255.U(8.W) // Standard error
+
+  // New DMA Status codes
+  val STATUS_DMA_BUSY              = 10.U(8.W) // General DMA busy
+  val STATUS_DMA_CONFIG_READY    = 11.U(8.W) // DMA configured, ready to start
+  val STATUS_DMA_IFM_LOAD_DONE   = 12.U(8.W)
+  val STATUS_DMA_KERNEL_LOAD_DONE= 13.U(8.W)
+  val STATUS_DMA_OFM_STORE_DONE  = 14.U(8.W)
+  val STATUS_DMA_ERROR           = 254.U(8.W) // DMA specific error
+  val STATUS_ERROR               = 255.U(8.W) // General error (keep)
+
+
+  // Helper objects for DMA configuration
+  object BufferIDs {
+    val IFM    = 0.U(2.W)
+    val KERNEL = 1.U(2.W)
+    val OFM    = 2.U(2.W)
+    // val MAX_ID = 2.U // For validation if needed
+  }
+
+  object DMADirection {
+    val MEM_TO_BUF = 0.U(1.W) // Read from Main Memory, Write to Accelerator Buffer
+    val BUF_TO_MEM = 1.U(1.W) // Read from Accelerator Buffer, Write to Main Memory
+  }
+
+  // Bit widths for packing DMA_CONFIG_PARAMS into rs1 of CMD_DMA_CONFIG_PARAMS
+  // Assuming rs1 is xLen, but RoCC commands typically use general purpose registers (e.g., 64-bit)
+  // Let's define based on a common register width, e.g., 64.
+  // If xLen can be 32, then this packing needs to be conditional or more constrained.
+  // For now, assume parameters fit.
+  val dmaConfigLenBits    = 24 // Allows up to 16MB transfers
+  val dmaConfigDirBits    = 1
+  val dmaConfigBufIdBits  = 2
+  val dmaConfigTotalParamBits = dmaConfigLenBits + dmaConfigDirBits + dmaConfigBufIdBits
+}
+```
+
+## File: src/test/scala/mycnnaccelerators/ComputeUnitTest.scala
+
+```scala
+package mycnnaccelerators
+
+import chisel3._
+import chisel3.util._
+import chisel3.simulator.EphemeralSimulator._
+import org.scalatest.flatspec.AnyFlatSpec
+// Please do not use chiseltest has been archived and is not recommended for new projects.
+
+case class AcceleratorConfig(
+  dataWidth: Int,
+  ifmRows: Int, ifmCols: Int,
+  kernelRows: Int, kernelCols: Int,
+  xLen: Int
+) {
+  val ofmRows: Int = ifmRows - kernelRows + 1
+  val ofmCols: Int = ifmCols - kernelCols + 1
+}
+
+class ComputeUnit(config: AcceleratorConfig) extends Module {
+  val io = IO(new Bundle {
+    val start = Input(Bool())
+    val done = Output(Bool())
+    val busy = Output(Bool())
+    val ifm_read_addr = Output(UInt(log2Ceil(config.ifmRows * config.ifmCols).W))
+    val ifm_read_data = Input(SInt(config.dataWidth.W))
+    val kernel_read_addr = Output(UInt(log2Ceil(config.kernelRows * config.kernelCols).W))
+    val kernel_read_data = Input(SInt(config.dataWidth.W))
+    val ofm_write_en = Output(Bool())
+    val ofm_write_addr = Output(UInt(log2Ceil(config.ofmRows * config.ofmCols).W))
+    val ofm_write_data = Output(SInt(config.dataWidth.W))
+  })
+
+  val s_idle :: s_busy :: s_done :: Nil = chisel3.util.Enum(3)
+  val state = RegInit(s_idle)
+
+  io.busy := (state === s_busy)
+  io.done := (state === s_done)
+
+  io.ifm_read_addr := 0.U
+  io.kernel_read_addr := 0.U
+  io.ofm_write_en := false.B
+  io.ofm_write_addr := 0.U
+  io.ofm_write_data := 0.S
+
+  switch(state) {
+    is(s_idle) {
+      when(io.start) { state := s_busy }
+    }
+    is(s_busy) {
+      when(RegNext(io.start)) { state := s_done }
+    }
+    is(s_done) { /* Stays done */ }
+  }
+}
+
+
+class ComputeUnitTest extends AnyFlatSpec {
+
+  val F_BITS_CU = 8
+  def toFixed(d: Double): BigInt = (d * (1L << F_BITS_CU)).round
+  def toDouble(sIntValue: BigInt): Double = {
+    sIntValue.doubleValue / (1L << F_BITS_CU)
+  }
+
+  def referenceConv(
+    ifm: Seq[Seq[Double]],
+    kernel: Seq[Seq[Double]],
+    config: AcceleratorConfig
+  ): Seq[Seq[Double]] = {
+    val ofm = Array.ofDim[Double](config.ofmRows, config.ofmCols)
+    val ACC_FRAC_BITS = config.dataWidth
+    for (r_ofm <- 0 until config.ofmRows) {
+      for (c_ofm <- 0 until config.ofmCols) {
+        var accumulatorDouble: Double = 0.0
+        for (r_k <- 0 until config.kernelRows) {
+          for (c_k <- 0 until config.kernelCols) {
+            val r_ifm = r_ofm + r_k
+            val c_ifm = c_ofm + c_k
+            if (r_ifm < config.ifmRows && c_ifm < config.ifmCols) {
+                 accumulatorDouble += ifm(r_ifm)(c_ifm) * kernel(r_k)(c_k)
+            }
+          }
+        }
+        val accFixedInternal = (accumulatorDouble * (1L << ACC_FRAC_BITS)).round
+        val shiftAmount = ACC_FRAC_BITS - F_BITS_CU
+        val shiftedAcc = if (shiftAmount >= 0) accFixedInternal >> shiftAmount else accFixedInternal << -shiftAmount
+        var finalSIntValue = shiftedAcc & ((BigInt(1) << config.dataWidth) - 1)
+        if ((finalSIntValue & (BigInt(1) << (config.dataWidth - 1))) != 0) {
+          finalSIntValue = finalSIntValue - (BigInt(1) << config.dataWidth)
+        }
+        ofm(r_ofm)(c_ofm) = toDouble(finalSIntValue)
+      }
+    }
+    ofm.map(_.toSeq).toSeq
+  }
+
+  behavior of "ComputeUnit"
+
+  it should "perform a 3x3 IFM, 2x2 Kernel convolution correctly" in {
+    val testConfig = AcceleratorConfig(
+      dataWidth = 16,
+      ifmRows = 3, ifmCols = 3,
+      kernelRows = 2, kernelCols = 2,
+      xLen = 64
+    )
+
+    val ifm_double = Seq(Seq(1.0, 2.0, 0.5), Seq(3.0, 1.5, 1.0), Seq(0.25, 2.5, 0.75))
+    val ifm_fixed_flat = ifm_double.flatten.map(d => toFixed(d)).toArray
+    val kernel_double = Seq(Seq(0.5, -1.0), Seq(1.0, 0.25))
+    val kernel_fixed_flat = kernel_double.flatten.map(d => toFixed(d)).toArray
+    val expected_ofm_double = referenceConv(ifm_double, kernel_double, testConfig)
+
+    simulate(new ComputeUnit(testConfig)) { dut =>
+      dut.io.start.poke(false)
+      dut.io.ifm_read_data.poke(BigInt(0))
+      dut.io.kernel_read_data.poke(BigInt(0))
+      dut.clock.step(1)
+
+      dut.io.start.poke(true)
+      dut.clock.step(1)
+      dut.io.start.poke(false)
+
+      val maxCycles = testConfig.ifmRows * testConfig.ifmCols * testConfig.kernelRows * testConfig.kernelCols *
+                      testConfig.ofmRows * testConfig.ofmCols + 200
+      var cycles = 0
+      val actual_ofm_map = collection.mutable.Map[(Int, Int), BigInt]()
+      var prev_ifm_addr: Option[Int] = None
+      var prev_kernel_addr: Option[Int] = None
+
+      println("Starting ChiselSim test loop...")
+      // Corrected: API for peeking values with EphemeralSimulator
+      // For Bool: .peek().litValue == BigInt(1) (or != 0.BigInt)
+      // For UInt/SInt: .peek().litValue
+      while (dut.io.done.peek().litValue != BigInt(1) && cycles < maxCycles) {
+        prev_ifm_addr match {
+          case Some(addr) if addr >= 0 && addr < ifm_fixed_flat.length =>
+            dut.io.ifm_read_data.poke(ifm_fixed_flat(addr))
+          case _ => dut.io.ifm_read_data.poke(BigInt(0))
+        }
+        prev_kernel_addr match {
+          case Some(addr) if addr >= 0 && addr < kernel_fixed_flat.length =>
+            dut.io.kernel_read_data.poke(kernel_fixed_flat(addr))
+          case _ => dut.io.kernel_read_data.poke(BigInt(0))
+        }
+
+        if (dut.io.ofm_write_en.peek().litValue == BigInt(1)) {
+          val ofm_addr = dut.io.ofm_write_addr.peek().litValue.toInt
+          val ofm_data_raw = dut.io.ofm_write_data.peek().litValue
+          
+          val r_ofm = ofm_addr / testConfig.ofmCols
+          val c_ofm = ofm_addr % testConfig.ofmCols
+          actual_ofm_map((r_ofm, c_ofm)) = ofm_data_raw
+        }
+
+        dut.clock.step(1)
+
+        prev_ifm_addr = Some(dut.io.ifm_read_addr.peek().litValue.toInt)
+        prev_kernel_addr = Some(dut.io.kernel_read_addr.peek().litValue.toInt)
+        
+        cycles += 1
+      }
+
+      println(s"ChiselSim simulation finished in $cycles cycles.")
+      assert(cycles < maxCycles, "Simulation timed out.")
+      assert(dut.io.done.peek().litValue == BigInt(1), "DUT did not signal done at the end.")
+
+      println("Verifying OFM results:")
+      var mismatches = 0
+      for (r <- 0 until testConfig.ofmRows) {
+        for (c <- 0 until testConfig.ofmCols) {
+          val actual_fixed = actual_ofm_map.getOrElse((r, c), BigInt(0))
+          val actual_double = toDouble(actual_fixed)
+          val expected_double = expected_ofm_double(r)(c)
+          print(f"OFM($r%d,$c%d): Actual=${actual_double}%6.4f (Fixed:$actual_fixed%d), Expected=${expected_double}%6.4f. ")
+          val tolerance = 1.0 / (1L << (F_BITS_CU - 1))
+          if (Math.abs(actual_double - expected_double) < tolerance) {
+            println("Match!")
+          } else {
+            println(f"Mismatch! Diff: ${Math.abs(actual_double - expected_double)}%.4f")
+            mismatches +=1
+          }
+        }
+      }
+      assert(mismatches == 0, s"$mismatches OFM value mismatches found.")
+    }
+  }
 }
 ```
 
