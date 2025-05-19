@@ -47,24 +47,24 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
   io.resp.valid := resp_valid_reg
   io.resp.bits.rd := resp_rd_reg
   io.resp.bits.data := resp_data_reg
-  io.busy := (compute_unit.io.busy || accelerator_status_reg === STATUS_COMPUTING) && (rocc_state =/= sIdle)
+  io.busy := (compute_unit.io.busy || accelerator_status_reg === STATUS_COMPUTING) && (rocc_state =/= sIdle) // Simplified busy logic for now
   io.interrupt := false.B // No interrupts for this simple version
 
   // Default connections for buffer write ports (controlled by RoCC FSM)
   ifm_buffer.io.write_en := false.B
   ifm_buffer.io.write_addr := 0.U
-  ifm_buffer.io.write_data := 0.U
+  ifm_buffer.io.write_data := 0.S(config.dataWidth.W) // CORRECTED: SInt literal
   // ifm_buffer.io.read_addr is driven by compute_unit
 
   kernel_buffer.io.write_en := false.B
   kernel_buffer.io.write_addr := 0.U
-  kernel_buffer.io.write_data := 0.U
+  kernel_buffer.io.write_data := 0.S(config.dataWidth.W) // CORRECTED: SInt literal
   // kernel_buffer.io.read_addr is driven by compute_unit
 
   // OFM buffer connections
   ofm_buffer.io.write_en := compute_unit.io.ofm_write_en // CU writes to OFM
   ofm_buffer.io.write_addr := compute_unit.io.ofm_write_addr
-  ofm_buffer.io.write_data := compute_unit.io.ofm_write_data
+  ofm_buffer.io.write_data := compute_unit.io.ofm_write_data // SInt to SInt (OK)
   ofm_buffer.io.read_addr := 0.U // Controlled by RoCC FSM for readback via CMD_GET_OFM_ADDR_DATA
 
   // Default connections for compute_unit inputs (controlled by RoCC FSM or wired below)
@@ -82,8 +82,8 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
   switch(rocc_state) {
     is(sIdle) {
       accelerator_status_reg := Mux(compute_unit.io.busy, STATUS_COMPUTING,
-                                Mux(compute_unit.io.done && accelerator_status_reg === STATUS_COMPUTING, STATUS_COMPUTE_DONE, // Latch if was computing
-                                    Mux(accelerator_status_reg === STATUS_COMPUTE_DONE, STATUS_COMPUTE_DONE, STATUS_IDLE))) // Hold done or idle
+                                Mux(compute_unit.io.done && accelerator_status_reg === STATUS_COMPUTING, STATUS_COMPUTE_DONE,
+                                    Mux(accelerator_status_reg === STATUS_COMPUTE_DONE, STATUS_COMPUTE_DONE, STATUS_IDLE)))
 
       when(io.cmd.valid && !resp_valid_reg) {
         val cmd = io.cmd.bits
@@ -96,7 +96,7 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
             when(cmd.rs1 < config.ifmDepth.U) {
               ifm_buffer.io.write_en   := true.B
               ifm_buffer.io.write_addr := cmd.rs1
-              ifm_buffer.io.write_data := cmd.rs2(config.dataWidth - 1, 0)
+              ifm_buffer.io.write_data := cmd.rs2(config.dataWidth - 1, 0).asSInt // CORRECTED: Cast to SInt
               accelerator_status_reg := STATUS_LOADING_IFM
             } .otherwise {
               accelerator_status_reg := STATUS_ERROR
@@ -107,7 +107,7 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
             when(cmd.rs1 < config.kernelDepth.U) {
               kernel_buffer.io.write_en   := true.B
               kernel_buffer.io.write_addr := cmd.rs1
-              kernel_buffer.io.write_data := cmd.rs2(config.dataWidth - 1, 0)
+              kernel_buffer.io.write_data := cmd.rs2(config.dataWidth - 1, 0).asSInt // CORRECTED: Cast to SInt
               accelerator_status_reg := STATUS_LOADING_KERNEL
             } .otherwise {
               accelerator_status_reg := STATUS_ERROR
@@ -124,19 +124,17 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
           is(CMD_GET_OFM_ADDR_DATA) {
             when(cmd.rs1 < config.ofmDepth.U) {
               ofm_buffer.io.read_addr := cmd.rs1
-              ofm_read_addr_reg := cmd.rs1 // Save for data fetch next cycle
+              // ofm_read_addr_reg := cmd.rs1 // Not strictly needed if data is read next cycle directly
               rocc_state := sWaitOFMRead
             } .otherwise {
-              resp_data_reg := STATUS_ERROR.asUInt
+              resp_data_reg := STATUS_ERROR.asUInt // Ensure STATUS_ERROR can fit or is truncated appropriately
               resp_valid_reg := true.B
               accelerator_status_reg := STATUS_ERROR
               rocc_state := sRespond // Go to respond to send error
             }
           }
           is(CMD_GET_STATUS) {
-            // Status is updated at the beginning of sIdle or when compute_unit.io.done fires.
-            // Here we just read the latched status.
-            resp_data_reg := accelerator_status_reg
+            resp_data_reg := accelerator_status_reg // Status reg is already UInt(8.W), will be zero-extended by assignment to UInt(xLen.W)
             resp_valid_reg := true.B
             rocc_state := sRespond // Go to respond state
           }
@@ -146,7 +144,11 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
 
     is(sWaitOFMRead) {
       // Data from ofm_buffer.io.read_data is valid in this cycle
-      resp_data_reg := ofm_buffer.io.read_data
+      // CORRECTED: Handle SInt from buffer to UInt RoCC response register with sign extension
+      val data_from_ofm = Wire(SInt(config.xLen.W))
+      data_from_ofm := ofm_buffer.io.read_data // Sign-extends from dataWidth to xLen
+      resp_data_reg := data_from_ofm.asUInt    // Convert to UInt
+
       resp_valid_reg := true.B
       rocc_state := sRespond
     }
@@ -162,8 +164,8 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
 
   // Connect Compute Unit to Buffers
   // Buffers provide data to CU (input to CU)
-  compute_unit.io.ifm_read_data    := ifm_buffer.io.read_data
-  compute_unit.io.kernel_read_data := kernel_buffer.io.read_data
+  compute_unit.io.ifm_read_data    := ifm_buffer.io.read_data    // SInt to SInt (OK)
+  compute_unit.io.kernel_read_data := kernel_buffer.io.read_data // SInt to SInt (OK)
 
   // CU drives its own read addresses to the buffers (output from CU)
   ifm_buffer.io.read_addr    := compute_unit.io.ifm_read_addr
