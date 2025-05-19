@@ -4,11 +4,11 @@ import chisel3._
 import chiseltest._
 import org.scalatest.flatspec.AnyFlatSpec
 import org.chipsalliance.cde.config.{Parameters, Config} // For Parameters and Config
+import mycnnaccelerators.{MyCNNAcceleratorKey, AcceleratorConfig, DefaultAcceleratorConfig}
 
-// It's good practice to have a specific test configuration if your DUT or its parameters
-// depend on the `implicit p: Parameters` pattern.
-// This reuses your MyCNNConfig for consistency.
-class TestConfigForMyCNN extends Config(new AcceleratorConfig)
+class TestConfigForMyCNN extends Config((site, here, up) => {
+    case MyCNNAcceleratorKey => DefaultAcceleratorConfig // Or new AcceleratorConfig(...) if you want to customize
+})
 
 class ScratchpadTester extends AnyFlatSpec with ChiselScalatestTester {
   behavior of "Scratchpad"

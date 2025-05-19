@@ -8,9 +8,8 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket.HellaCacheReq
 import freechips.rocketchip.rocket.HellaCacheResp
 import freechips.rocketchip.rocket.constants.MemoryOpConstants._ // For M_XRD, M_XWR etc.
-import org.chipsalliance.cde.config.Config
-import org.chipsalliance.cde.config.Parameters
-
+import org.chipsalliance.cde.config.{Parameters, Config}
+import mycnnaccelerators.{MyCNNAcceleratorKey, AcceleratorConfig, DefaultAcceleratorConfig}
 class TestDMAConfig extends Config((site, here, up) => {
   case MyCNNAcceleratorKey => AcceleratorConfig(
       // You can override specific parameters here if needed for the test

@@ -4,8 +4,11 @@ import chisel3._
 import chiseltest._
 import org.scalatest.flatspec.AnyFlatSpec
 import org.chipsalliance.cde.config.{Parameters, Config}
+import mycnnaccelerators.{MyCNNAcceleratorKey, AcceleratorConfig, DefaultAcceleratorConfig}
 
-class TestConfigForComputeUnit extends Config(new AcceleratorConfig)
+class TestConfigForComputeUnit extends Config((site, here, up) => {
+    case MyCNNAcceleratorKey => DefaultAcceleratorConfig // Or new AcceleratorConfig(...) if you want to customize
+})
 
 class ComputeUnitTester extends AnyFlatSpec with ChiselScalatestTester {
   behavior of "ComputeUnit"

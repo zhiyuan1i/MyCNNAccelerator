@@ -8,10 +8,14 @@ import freechips.rocketchip.tile.RoCCCommand
 import CNNAcceleratorISA._ // Import your ISA definitions
 import freechips.rocketchip.rocket.HellaCacheIO
 import AcceleratorConfig._
+import mycnnaccelerators.{MyCNNAcceleratorKey, AcceleratorConfig, DefaultAcceleratorConfig}
 
 // Assuming you have a AcceleratorConfig similar to the one used in ScratchpadTester
 // If not, you might need to create or adjust this part.
-class TestConfigForCNNController extends Config(new AcceleratorConfig)
+class TestConfigForCNNController extends Config((site, here, up) => {
+    case MyCNNAcceleratorKey => DefaultAcceleratorConfig // Or new AcceleratorConfig(...) if you want to customize
+})
+
 
 class CNNControllerTester extends AnyFlatSpec with ChiselScalatestTester {
   behavior of "CNNController"
