@@ -70,9 +70,11 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
   io.resp.valid := resp_valid_reg
   io.resp.bits.rd := resp_rd_reg
   io.resp.bits.data := resp_data_reg
-  io.busy := (compute_unit.io.busy || dma_ctrl_io.busy || (rocc_state =/= sIdle))
+  // RoCC is busy if CU is busy, DMA is busy, or FSM is not sIdle, or it's currently trying to send a response.
+  io.busy := (compute_unit.io.busy || dma_ctrl_io.busy || (rocc_state =/= sIdle) || resp_valid_reg)
   io.interrupt := false.B
 
+  // Default assignments for buffer writes (mostly controlled by DMA or ComputeUnit)
   ifm_buffer.io.write_en := false.B
   ifm_buffer.io.write_addr := 0.U
   ifm_buffer.io.write_data := 0.S(config.dataWidth.W)
@@ -81,25 +83,29 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
   kernel_buffer.io.write_addr := 0.U
   kernel_buffer.io.write_data := 0.S(config.dataWidth.W)
 
+  // OFM buffer is written by ComputeUnit
   ofm_buffer.io.write_en := compute_unit.io.ofm_write_en
   ofm_buffer.io.write_addr := compute_unit.io.ofm_write_addr
   ofm_buffer.io.write_data := compute_unit.io.ofm_write_data
-  ofm_buffer.io.read_addr := 0.U
+  ofm_buffer.io.read_addr := 0.U // Read address for OFM typically driven by DMA
 
-  compute_unit.io.start := false.B
+  // ComputeUnit connections
+  compute_unit.io.start := false.B // Controlled by FSM
   compute_unit.io.ifm_read_data   := ifm_buffer.io.read_data
   compute_unit.io.kernel_read_data := kernel_buffer.io.read_data
   ifm_buffer.io.read_addr       := compute_unit.io.ifm_read_addr
-  kernel_buffer.io.read_addr    := compute_unit.io.kernel_read_addr
+  kernel_buffer.io.read_addr      := compute_unit.io.kernel_read_addr
 
-  dma_ctrl_io.start := false.B
+  // DMA controller connections
+  dma_ctrl_io.start := false.B // Controlled by FSM
   dma_ctrl_io.mem_base_addr := dma_mem_base_addr_reg
   dma_ctrl_io.length_bytes := dma_length_bytes_reg
   dma_ctrl_io.directionBits := dma_direction_reg
   dma_ctrl_io.buffer_id := dma_buffer_id_reg
 
+  // Logic for handling response acknowledgement from CPU
   when(resp_valid_reg && io.resp.ready) {
-    resp_valid_reg := false.B
+    resp_valid_reg := false.B // Clear valid once CPU takes it
     if (enableRoccDebugPrints.litToBoolean) {
       printf(p"RoCC Cycle[${roccCycleCount}]: CPU took response. rd=${io.resp.bits.rd}, data=0x${Hexadecimal(io.resp.bits.data)}\n")
     }
@@ -122,23 +128,28 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
     when(compute_completed_flag =/= compute_completed_flag_prev) {
       printf(p"RoCC Cycle[${roccCycleCount}]: compute_completed_flag changed to ${compute_completed_flag}\n")
     }
-     when(dma_configured_flag =/= dma_configured_flag_prev) {
+    when(dma_configured_flag =/= dma_configured_flag_prev) {
       printf(p"RoCC Cycle[${roccCycleCount}]: dma_configured_flag changed to ${dma_configured_flag}\n")
     }
     when(io.cmd.fire) { // Log received command
         printf(p"RoCC Cycle[${roccCycleCount}]: CMD Received: funct=${io.cmd.bits.inst.funct}, rs1=0x${Hexadecimal(io.cmd.bits.rs1)}, rs2=0x${Hexadecimal(io.cmd.bits.rs2)}, rd=${io.cmd.bits.inst.rd}\n")
     }
-    when(dma_ctrl_io.start) {
-        printf(p"RoCC Cycle[${roccCycleCount}]: DMA Start asserted. BufID=${dma_buffer_id_reg}, Dir=${dma_direction_reg}, Len=${dma_length_bytes_reg}, Addr=0x${Hexadecimal(dma_mem_base_addr_reg)}\n")
+    // More specific debugs for start signals
+    val dma_start_asserted_for_debug = RegNext(dma_ctrl_io.start, false.B)
+    when(dma_ctrl_io.start && !dma_start_asserted_for_debug) { // Print only on rising edge
+        printf(p"RoCC Cycle[${roccCycleCount}]: DMA Start (dma_ctrl_io.start) asserted by RoCC. BufID=${dma_buffer_id_reg}, Dir=${dma_direction_reg}, Len=${dma_length_bytes_reg}, Addr=0x${Hexadecimal(dma_mem_base_addr_reg)}\n")
     }
-    when(compute_unit.io.start) {
-        printf(p"RoCC Cycle[${roccCycleCount}]: Compute Unit Start asserted.\n")
+    val compute_start_asserted_for_debug = RegNext(compute_unit.io.start, false.B)
+    when(compute_unit.io.start && !compute_start_asserted_for_debug) { // Print only on rising edge
+        printf(p"RoCC Cycle[${roccCycleCount}]: Compute Unit Start (compute_unit.io.start) asserted by RoCC.\n")
     }
   }
 
 
+  // Main RoCC FSM
   switch(rocc_state) {
     is(sIdle) {
+      // Check for asynchronous events completion (like compute unit finishing)
       when(accelerator_status_reg === STATUS_COMPUTING && compute_unit.io.done && !compute_unit.io.busy) {
         if (enableRoccDebugPrints.litToBoolean) {
             printf(p"RoCC Cycle[${roccCycleCount}]: Compute unit finished (detected in sIdle). Setting STATUS_COMPUTE_DONE.\n")
@@ -147,50 +158,60 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
         compute_completed_flag := true.B
       }
 
-      when(io.cmd.valid && !resp_valid_reg) {
-        val cmd = io.cmd.bits
-        resp_rd_reg := cmd.inst.rd
+      // If DMA was started (status is DMA_BUSY) and the DMA controller is indeed busy, RoCC should be in sDmaActive
+      when(accelerator_status_reg === STATUS_DMA_BUSY && dma_ctrl_io.busy) {
+         if (enableRoccDebugPrints.litToBoolean) {
+            printf(p"RoCC Cycle[${roccCycleCount}]: DMA is busy and status is DMA_BUSY, RoCC FSM transitioning from sIdle to sDmaActive.\n")
+         }
+         rocc_state := sDmaActive
+      }
 
-        resp_data_reg := STATUS_ERROR.asUInt
-        resp_valid_reg := true.B
-        rocc_state := sRespond
+      // Process incoming RoCC command
+      when(io.cmd.valid && !resp_valid_reg) { // Ensure not already processing a response
+        val cmd = io.cmd.bits
+        resp_rd_reg := cmd.inst.rd // Capture rd for the response
+
+        resp_data_reg := STATUS_ERROR.asUInt // Default response data
+        resp_valid_reg := true.B             // Default to send a response
+        rocc_state := sRespond               // Default next state to handle CPU taking the response.
 
         switch(cmd.inst.funct) {
           is(CMD_SET_IFM_ADDR_DATA) {
-            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_SET_IFM_ADDR_DATA (funct=${cmd.inst.funct}) - Not Implemented.\n") }
+            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_SET_IFM_ADDR_DATA (funct=${cmd.inst.funct}) - Not Implemented. Responding with STATUS_ERROR.\n") }
+            // resp_data_reg is already STATUS_ERROR
           }
           is(CMD_SET_KERNEL_ADDR_DATA) {
-            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_SET_KERNEL_ADDR_DATA (funct=${cmd.inst.funct}) - Not Implemented.\n") }
+            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_SET_KERNEL_ADDR_DATA (funct=${cmd.inst.funct}) - Not Implemented. Responding with STATUS_ERROR.\n") }
+            // resp_data_reg is already STATUS_ERROR
           }
           is(CMD_GET_OFM_ADDR_DATA) {
-            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_GET_OFM_ADDR_DATA (funct=${cmd.inst.funct}) - Not Implemented.\n") }
+            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_GET_OFM_ADDR_DATA (funct=${cmd.inst.funct}) - Not Implemented. Responding with STATUS_ERROR.\n") }
+            // resp_data_reg is already STATUS_ERROR
           }
 
           is(CMD_START_COMPUTE) {
-            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: Processing CMD_START_COMPUTE (funct=${cmd.inst.funct}). IFM Loaded: ${ifm_loaded_flag}, Kernel Loaded: ${kernel_loaded_flag}, CU Busy: ${compute_unit.io.busy}, DMA Busy: ${dma_ctrl_io.busy}\n")}
+            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: Processing CMD_START_COMPUTE. IFM_L=${ifm_loaded_flag}, KERN_L=${kernel_loaded_flag}, CU_Busy=${compute_unit.io.busy}, DMA_Busy=${dma_ctrl_io.busy}\n")}
             when(ifm_loaded_flag && kernel_loaded_flag && !compute_unit.io.busy && !dma_ctrl_io.busy) {
               compute_unit.io.start := true.B
               accelerator_status_reg := STATUS_COMPUTING
               compute_completed_flag := false.B
-              resp_valid_reg := false.B
-              rocc_state := sIdle
-              if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_START_COMPUTE: Conditions met. Starting compute.\n")}
+              resp_data_reg := accelerator_status_reg
+              if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_START_COMPUTE: Conditions met. Starting compute. Responding with ACK (${accelerator_status_reg}).\n")}
             } .otherwise {
               if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_START_COMPUTE: Error - preconditions not met. Responding with STATUS_ERROR.\n")}
-              // resp_data_reg already STATUS_ERROR by default
             }
           }
           is(CMD_DMA_CONFIG_ADDR) {
-            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: Processing CMD_DMA_CONFIG_ADDR (funct=${cmd.inst.funct}). Addr=0x${Hexadecimal(cmd.rs1)}\n")}
+            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: Processing CMD_DMA_CONFIG_ADDR. Addr=0x${Hexadecimal(cmd.rs1)}\n")}
             dma_mem_base_addr_reg := cmd.rs1
             dma_addr_configured_internal_flag := true.B
             dma_configured_flag := false.B
             accelerator_status_reg := STATUS_IDLE
-            resp_valid_reg := false.B
-            rocc_state := sIdle
+            resp_data_reg := accelerator_status_reg
+            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_CONFIG_ADDR: Configured. Responding with ACK (${accelerator_status_reg}).\n")}
           }
           is(CMD_DMA_CONFIG_PARAMS) {
-            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: Processing CMD_DMA_CONFIG_PARAMS (funct=${cmd.inst.funct}). Params=0x${Hexadecimal(cmd.rs1)}. Addr Configured: ${dma_addr_configured_internal_flag}\n")}
+            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: Processing CMD_DMA_CONFIG_PARAMS. Params=0x${Hexadecimal(cmd.rs1)}. AddrInternalFlag=${dma_addr_configured_internal_flag}\n")}
             when(dma_addr_configured_internal_flag) {
               val param_val = cmd.rs1
               dma_buffer_id_reg := param_val(dmaConfigBufIdBits - 1, 0)
@@ -199,9 +220,8 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
               dma_configured_flag := true.B
               dma_addr_configured_internal_flag := false.B
               accelerator_status_reg := STATUS_DMA_CONFIG_READY
-              resp_valid_reg := false.B
-              rocc_state := sIdle
-              if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_CONFIG_PARAMS: Parsed. BufID=${dma_buffer_id_reg}, Dir=${dma_direction_reg}, Len=${dma_length_bytes_reg}. Status=STATUS_DMA_CONFIG_READY.\n")}
+              resp_data_reg := accelerator_status_reg
+              if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_CONFIG_PARAMS: Parsed. BufID=${dma_buffer_id_reg}, Dir=${dma_direction_reg}, Len=${dma_length_bytes_reg}. Status=${accelerator_status_reg}. Responding with ACK.\n")}
             } .otherwise {
               accelerator_status_reg := STATUS_DMA_ERROR
               resp_data_reg := STATUS_DMA_ERROR.asUInt
@@ -212,56 +232,53 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
             val is_ofm_dma_write = (dma_direction_reg === DMADirection.BUF_TO_MEM && dma_buffer_id_reg === BufferIDs.OFM)
             val common_dma_start_conditions = dma_configured_flag && !dma_ctrl_io.busy && !compute_unit.io.busy
             if (enableRoccDebugPrints.litToBoolean) {
-                printf(p"RoCC Cycle[${roccCycleCount}]: Processing CMD_DMA_START (funct=${cmd.inst.funct}). Is OFM Write: ${is_ofm_dma_write}, DMA Configured: ${dma_configured_flag}, Compute Done (if OFM): ${compute_completed_flag}, DMA Busy: ${dma_ctrl_io.busy}, CU Busy: ${compute_unit.io.busy}\n")
+                printf(p"RoCC Cycle[${roccCycleCount}]: Processing CMD_DMA_START. IsOFMWrite=${is_ofm_dma_write}, DMAConf=${dma_configured_flag}, CompDone(ifOFM)=${compute_completed_flag}, DMABusy=${dma_ctrl_io.busy}, CUBusy=${compute_unit.io.busy}\n")
             }
 
+            val can_start_dma = WireDefault(false.B)
             when(common_dma_start_conditions) {
               when(is_ofm_dma_write) {
                 when(compute_completed_flag) {
-                  dma_ctrl_io.start := true.B
-                  accelerator_status_reg := STATUS_DMA_BUSY
-                  rocc_state := sDmaActive
-                  resp_valid_reg := false.B
-                  if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_START: OFM Write. Conditions met. Starting DMA.\n")}
-                } .otherwise {
-                  if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_START: OFM Write Error - Compute not completed. Responding with STATUS_ERROR.\n")}
-                }
+                  can_start_dma := true.B
+                } .otherwise { /* Error: Compute not done for OFM write */ }
               } .elsewhen(dma_direction_reg === DMADirection.MEM_TO_BUF) {
-                  dma_ctrl_io.start := true.B
-                  when(dma_buffer_id_reg === BufferIDs.IFM) { ifm_loaded_flag := false.B }
-                  .elsewhen(dma_buffer_id_reg === BufferIDs.KERNEL) { kernel_loaded_flag := false.B }
-                  accelerator_status_reg := STATUS_DMA_BUSY
-                  rocc_state := sDmaActive
-                  resp_valid_reg := false.B
-                  if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_START: IFM/Kernel Load. Starting DMA. BufferID=${dma_buffer_id_reg}.\n")}
-              } .otherwise {
-                  if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_START: Error - Invalid DMA op (e.g. BUF_TO_MEM for IFM/Kernel). Responding with STATUS_ERROR.\n")}
-              }
+                  can_start_dma := true.B
+              } .otherwise { /* Error: Invalid DMA direction/buffer combo for start */ }
+            } .otherwise { /* Error: Common conditions not met (not configured or busy) */ }
+
+            when(can_start_dma) {
+                dma_ctrl_io.start := true.B
+                when(dma_direction_reg === DMADirection.MEM_TO_BUF) {
+                    when(dma_buffer_id_reg === BufferIDs.IFM) { ifm_loaded_flag := false.B }
+                    .elsewhen(dma_buffer_id_reg === BufferIDs.KERNEL) { kernel_loaded_flag := false.B }
+                }
+                accelerator_status_reg := STATUS_DMA_BUSY
+                resp_data_reg := accelerator_status_reg
+                if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_START: Conditions met. Starting DMA. Responding with ACK (${accelerator_status_reg}).\n")}
             } .otherwise {
-                if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_START: Error - Common conditions not met (not configured or busy). Responding with STATUS_ERROR.\n")}
+                if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_START: Error - conditions not met. Responding with STATUS_ERROR.\n")}
             }
           }
           is(CMD_GET_STATUS) {
             resp_data_reg := accelerator_status_reg
-            // resp_valid_reg and rocc_state already set to respond by defaults.
-            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: Processing CMD_GET_STATUS (funct=${cmd.inst.funct}). Returning status: ${accelerator_status_reg}\n")}
+            if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: Processing CMD_GET_STATUS. Returning status: ${accelerator_status_reg}\n")}
           }
-          // Default case for unknown funct is handled by the pre-switch default assignments
         }
       }
-    }
+    } // end is(sIdle)
 
     is(sDmaActive) {
-      if (enableRoccDebugPrints.litToBoolean) {
-        when(dma_ctrl_io.busy) {
-          // Potentially too verbose, but can be useful
-          // printf(p"RoCC Cycle[${roccCycleCount}]: In sDmaActive, DMA is busy.\n")
-        }
+      if (enableRoccDebugPrints.litToBoolean) { // This is a Scala if, checks the Chisel Bool *literal*
+          when(dma_ctrl_io.busy) { // This is a Chisel when, checks the hardware signal at runtime
+            // printf(p"RoCC Cycle[${roccCycleCount}]: In sDmaActive, DMA controller is busy (dma_ctrl_io.busy=${dma_ctrl_io.busy}).\n") // Example of printing a runtime signal
+          }
       }
+
       when(dma_ctrl_io.done) {
         val completed_op_buffer = dma_buffer_id_reg
         val completed_op_dir = dma_direction_reg
-        if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: DMA Done signal received. Op BufID=${completed_op_buffer}, Op Dir=${completed_op_dir}.\n")}
+
+        if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: DMA Done signal received in sDmaActive. Op BufID=${completed_op_buffer}, Op Dir=${completed_op_dir}.\n")}
 
         when(completed_op_dir === DMADirection.MEM_TO_BUF) {
           when(completed_op_buffer === BufferIDs.IFM) {
@@ -285,10 +302,9 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
           accelerator_status_reg := STATUS_DMA_ERROR
         }
         dma_configured_flag := false.B
-        dma_addr_configured_internal_flag := false.B
         rocc_state := sIdle
       } .elsewhen(dma_ctrl_io.dma_error) {
-        if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: DMA Error signal received.\n")}
+        if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: DMA Error signal received in sDmaActive.\n")}
         accelerator_status_reg := STATUS_DMA_ERROR
         ifm_loaded_flag := false.B
         kernel_loaded_flag := false.B
@@ -296,43 +312,52 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
         dma_configured_flag := false.B
         dma_addr_configured_internal_flag := false.B
         rocc_state := sIdle
+      } .elsewhen(!dma_ctrl_io.busy) {
+        if (enableRoccDebugPrints.litToBoolean) {
+          printf(p"RoCC Cycle[${roccCycleCount}]: In sDmaActive, DMA controller no longer busy (and no done/error this cycle). Returning to sIdle.\n")
+        }
+        rocc_state := sIdle
       }
+    } // end is(sDmaActive)
+
+    is(sWaitOFMRead) {
+      if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: In UNUSED sWaitOFMRead state. Transitioning to sIdle.\n") }
+      rocc_state := sIdle
     }
 
-    is(sWaitOFMRead) { /* This state is currently unused */ }
     is(sRespond) {
       if (enableRoccDebugPrints.litToBoolean) {
-        // printf(p"RoCC Cycle[${roccCycleCount}]: In sRespond. Waiting for CPU to take response. resp_valid_reg=${resp_valid_reg}, io.resp.ready=${io.resp.ready}\n")
+        // printf(p"RoCC Cycle[${roccCycleCount}]: In sRespond. resp_valid_reg=${resp_valid_reg}, io.resp.ready=${io.resp.ready}\n")
       }
-      when(!resp_valid_reg || io.resp.ready) { // If response was already taken (e.g. by fast CPU) or CPU is ready now
-        resp_valid_reg := false.B // Ensure it's de-asserted
+      when(!resp_valid_reg) { // Response has been taken by CPU
         rocc_state := sIdle
         if (enableRoccDebugPrints.litToBoolean) {
-            // This log might fire one cycle after CPU takes response if !resp_valid_reg triggers it.
-            // printf(p"RoCC Cycle[${roccCycleCount}]: Response taken or ready, transitioning from sRespond to sIdle.\n")
+             printf(p"RoCC Cycle[${roccCycleCount}]: Response taken by CPU, transitioning from sRespond to sIdle.\n")
         }
       }
-    }
-  }
+    } // end is(sRespond)
+  } // end switch(rocc_state)
 
-  val spad_write_target_is_ifm = dma_buffer_id_reg === BufferIDs.IFM && dma_direction_reg === DMADirection.MEM_TO_BUF && (rocc_state === sDmaActive || dma_ctrl_io.start)
-  val spad_write_target_is_kernel = dma_buffer_id_reg === BufferIDs.KERNEL && dma_direction_reg === DMADirection.MEM_TO_BUF && (rocc_state === sDmaActive || dma_ctrl_io.start)
+  val dma_is_writing_to_spad = dma_direction_reg === DMADirection.MEM_TO_BUF && (rocc_state === sDmaActive || dma_ctrl_io.start)
+  val spad_write_target_is_ifm    = dma_buffer_id_reg === BufferIDs.IFM    && dma_is_writing_to_spad
+  val spad_write_target_is_kernel = dma_buffer_id_reg === BufferIDs.KERNEL && dma_is_writing_to_spad
 
-  ifm_buffer.io.write_en := dma_ctrl_io.spad_write_en && spad_write_target_is_ifm
-  ifm_buffer.io.write_addr := dma_ctrl_io.spad_write_addr
-  ifm_buffer.io.write_data := dma_ctrl_io.spad_write_data
+  ifm_buffer.io.write_en    := dma_ctrl_io.spad_write_en && spad_write_target_is_ifm
+  ifm_buffer.io.write_addr  := dma_ctrl_io.spad_write_addr
+  ifm_buffer.io.write_data  := dma_ctrl_io.spad_write_data
 
-  kernel_buffer.io.write_en := dma_ctrl_io.spad_write_en && spad_write_target_is_kernel
+  kernel_buffer.io.write_en   := dma_ctrl_io.spad_write_en && spad_write_target_is_kernel
   kernel_buffer.io.write_addr := dma_ctrl_io.spad_write_addr
   kernel_buffer.io.write_data := dma_ctrl_io.spad_write_data
 
-  val spad_read_source_is_ofm = dma_buffer_id_reg === BufferIDs.OFM && dma_direction_reg === DMADirection.BUF_TO_MEM && (rocc_state === sDmaActive || dma_ctrl_io.start)
+  val dma_is_reading_from_spad = dma_direction_reg === DMADirection.BUF_TO_MEM && (rocc_state === sDmaActive || dma_ctrl_io.start)
+  val spad_read_source_is_ofm  = dma_buffer_id_reg === BufferIDs.OFM && dma_is_reading_from_spad
 
   when(spad_read_source_is_ofm) {
-    ofm_buffer.io.read_addr := dma_ctrl_io.spad_read_addr
-    dma_ctrl_io.spad_read_data := ofm_buffer.io.read_data
+    ofm_buffer.io.read_addr     := dma_ctrl_io.spad_read_addr
+    dma_ctrl_io.spad_read_data  := ofm_buffer.io.read_data
   } .otherwise {
-    dma_ctrl_io.spad_read_data := 0.S
+    dma_ctrl_io.spad_read_data  := 0.S
   }
 
   // if (enableRoccDebugPrints.litToBoolean) {
