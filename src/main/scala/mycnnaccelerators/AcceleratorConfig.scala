@@ -1,56 +1,53 @@
 // filename: AcceleratorConfig.scala
 package mycnnaccelerators
 
-import chisel3._ // Not strictly needed in this file if only using Ints and log2Ceil from util
 import chisel3.util.log2Ceil
 
-// Basic Accelerator Configuration
 case class AcceleratorConfig(
-  // Data width for IFM, Kernel, OFM elements (total bits)
   dataWidth: Int = 16,
-
-  // Number of fractional bits for fixed-point data representation
-  // Assumes IFM, Kernel, and OFM elements use this format.
-  F_BITS: Int = 8, // Example: if dataWidth is 16, this could be Qs7.8 (1 sign, 7 int, 8 frac)
-
-  // IFM Dimensions (fixed)
+  F_BITS: Int = 8,
   ifmRows: Int = 8,
   ifmCols: Int = 8,
-
-  // Kernel Dimensions (fixed)
   kernelRows: Int = 3,
   kernelCols: Int = 3,
-
-  // RoCC Core's xLen (register width, e.g., 64 bits)
-  // This will be updated by the RoCC wrapper from the core's parameters.
-  xLen: Int = 64 // Default, will be overridden
+  xLen: Int = 64,
+  // Add a parameter to define convolution type, or assume 'same'
+  val isSameConvolution: Boolean = true // Make 'same' the default or set via constructor
 ) {
-  // Derived parameters
-
-  // Check for valid F_BITS relative to dataWidth
-  // F_BITS must be less than dataWidth (to allow for at least a sign bit or an integer bit)
   require(F_BITS < dataWidth, "F_BITS must be less than dataWidth")
   require(F_BITS >= 0, "F_BITS cannot be negative")
 
   val ifmDepth: Int = ifmRows * ifmCols
   val kernelDepth: Int = kernelRows * kernelCols
 
-  // OFM Dimensions (calculated for 'valid' convolution, no padding, stride 1)
-  val ofmRows: Int = ifmRows - kernelRows + 1
-  val ofmCols: Int = ifmCols - kernelCols + 1
-  val ofmDepth: Int = ofmRows * ofmCols
+  // Derive OFM dimensions based on convolution type
+  val actualOfmRows: Int = if (isSameConvolution) ifmRows else (ifmRows - kernelRows + 1)
+  val actualOfmCols: Int = if (isSameConvolution) ifmCols else (ifmCols - kernelCols + 1)
+  val ofmDepth: Int = actualOfmRows * actualOfmCols // Use actualOfmRows/Cols
 
-  // Address widths for buffers
-  // Ensure depth is at least 1 for log2Ceil, or handle zero/negative depths if possible from dimensions
-  require(ifmDepth > 0, "IFM depth must be positive to calculate address width.")
-  require(kernelDepth > 0, "Kernel depth must be positive to calculate address width.")
-  require(ofmDepth > 0, "OFM depth must be positive to calculate address width.")
+  require(ifmDepth > 0, "IFM depth must be positive.")
+  require(kernelDepth > 0, "Kernel depth must be positive.")
+  require(ofmDepth > 0, "OFM depth must be positive.")
 
-  val ifmAddrWidth: Int = log2Ceil(ifmDepth)
-  val kernelAddrWidth: Int = log2Ceil(kernelDepth)
-  val ofmAddrWidth: Int = log2Ceil(ofmDepth)
+  val ifmAddrWidth: Int = math.max(1, log2Ceil(ifmDepth))
+  val kernelAddrWidth: Int = math.max(1, log2Ceil(kernelDepth))
+  val ofmAddrWidth: Int = math.max(1, log2Ceil(ofmDepth)) // Uses depth from actualOfmRows/Cols
+
+  // Provide access to the OFM dimensions that ComputeUnit will use for its loops and addressing
+  // This makes it explicit what dimensions the ComputeUnit should iterate over for its output.
+  // In your ComputeUnit, you would then use config.outputRows and config.outputCols for out_r/out_c limits.
+  // However, if ComputeUnit directly uses ifmRows/ifmCols for its output loops when doing 'same',
+  // then AcceleratorConfig's ofmRows/ofmCols MUST be ifmRows/ifmCols.
+  // The key is that the ComputeUnit's loop limits (e.g., config.ifmRows) and the
+  // AcceleratorConfig's ofmRows (used by testbench) must match.
+
+  // For clarity, if ComputeUnit uses config.ifmRows for output loops:
+  // The testbench should use dutConfig.ifmRows for expected OFM size.
+  // The AcceleratorConfig's ofmRows field should reflect config.ifmRows if isSameConvolution is true.
+  // The code above with actualOfmRows/actualOfmCols for ofmDepth/ofmAddrWidth is correct.
+  // The ComputeUnit should use config.ifmRows/Cols for its out_r/out_c loop limits
+  // and for ofm_write_addr calculation like: out_r * config.ifmCols.U + out_c.
+  // The testbench will use dutConfig.actualOfmRows/actualOfmCols for its loops and cycle counts.
 }
 
-// Default configuration object.
-// MyCNNRoCC will typically create the actual config with the correct xLen and potentially other overrides.
 object DefaultAcceleratorConfig extends AcceleratorConfig()
