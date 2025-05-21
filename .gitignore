@@ -1,3 +1,6 @@
 src/target/*
 target/*
 project/*
+src/main/scala/mycnnaccelerators/*.md
+*.o
+*.riscv
