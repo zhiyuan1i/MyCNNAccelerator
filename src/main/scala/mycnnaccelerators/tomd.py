@@ -52,7 +52,7 @@ if __name__ == "__main__":
     # Define the Markdown file whose content needs to be included
     markdown_to_include_path = os.path.join(base_project_dir, "RISC-V.md") # Markdown file to add
 
-    # Define the output Markdown file (using the path from your original script)
+    # Define the output Markdown file (using the path from my original script)
     # This path is /home/lzy/chipyard/generators/mycnnaccelerators/src/main/scala/mycnnaccelerators/mycnnaccelerators_scala_files.md
     output_md_file_path = os.path.join(scala_source_main_dir, "mycnnaccelerators_scala_files.md")
 
