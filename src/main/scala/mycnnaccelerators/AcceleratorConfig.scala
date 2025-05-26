@@ -6,10 +6,10 @@ import chisel3.util.log2Ceil
 case class AcceleratorConfig(
   dataWidth: Int = 16,
   F_BITS: Int = 8,
-  ifmRows: Int = 8,
-  ifmCols: Int = 8,
-  kernelRows: Int = 3,
-  kernelCols: Int = 3,
+  ifmRows: Int = 32,
+  ifmCols: Int = 32,
+  kernelRows: Int = 5,
+  kernelCols: Int = 5,
   xLen: Int = 64,
   // Add a parameter to define convolution type, or assume 'same'
   val isSameConvolution: Boolean = true // Make 'same' the default or set via constructor

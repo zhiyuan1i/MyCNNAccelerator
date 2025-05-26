@@ -76,15 +76,15 @@ class ComputeUnit(val config: AcceleratorConfig) extends Module {
 
   val enableDebugPrints = false.B // Set to true for local debugging
   if (enableDebugPrints.litToBoolean) {
-    printf(p"DUT Cycle[${dutCycleCount}]: -------------------- Cycle Start --------------------\n")
-    printf(p"DUT Cycle[${dutCycleCount}]: State: ${state} (Idle=${sIdle}, FetchIFM=${sFetchIFM}, FetchKernel=${sFetchKernel}, MAC=${sMAC}, WriteOFM=${sWriteOFM}, DoneCU=${sDoneCU})\n")
-    printf(p"DUT Cycle[${dutCycleCount}]: data_fetch_cycle: ${data_fetch_cycle}, ifm_access_is_pad: ${ifm_access_is_pad}\n")
-    printf(p"DUT Cycle[${dutCycleCount}]: Counters: out_r=${out_r}, out_c=${out_c}, k_r=${k_r}, k_c=${k_c}\n")
-    printf(p"DUT Cycle[${dutCycleCount}]: Padding: pad_rows=${pad_rows_val}, pad_cols=${pad_cols_val}\n")
-    printf(p"DUT Cycle[${dutCycleCount}]: Accumulator: ${accumulator} (dec), 0x${Hexadecimal(accumulator)}\n")
-    printf(p"DUT Cycle[${dutCycleCount}]: Inputs: start=${io.start}, ifm_rd_data=${io.ifm_read_data}, krnl_rd_data=${io.kernel_read_data}\n")
-    printf(p"DUT Cycle[${dutCycleCount}]: Outputs: ifm_addr=${io.ifm_read_addr}, krnl_addr=${io.kernel_read_addr}\n")
-    printf(p"DUT Cycle[${dutCycleCount}]: Outputs: ofm_wr_en=${io.ofm_write_en}, ofm_wr_addr=${io.ofm_write_addr}, ofm_data=${io.ofm_write_data} (dec)\n")
+    printf(p"RoCC DUT Cycle[${dutCycleCount}]: -------------------- Cycle Start --------------------\n")
+    printf(p"RoCC DUT Cycle[${dutCycleCount}]: State: ${state} (Idle=${sIdle}, FetchIFM=${sFetchIFM}, FetchKernel=${sFetchKernel}, MAC=${sMAC}, WriteOFM=${sWriteOFM}, DoneCU=${sDoneCU})\n")
+    printf(p"RoCC DUT Cycle[${dutCycleCount}]: data_fetch_cycle: ${data_fetch_cycle}, ifm_access_is_pad: ${ifm_access_is_pad}\n")
+    printf(p"RoCC DUT Cycle[${dutCycleCount}]: Counters: out_r=${out_r}, out_c=${out_c}, k_r=${k_r}, k_c=${k_c}\n")
+    printf(p"RoCC DUT Cycle[${dutCycleCount}]: Padding: pad_rows=${pad_rows_val}, pad_cols=${pad_cols_val}\n")
+    printf(p"RoCC DUT Cycle[${dutCycleCount}]: Accumulator: ${accumulator} (dec), 0x${Hexadecimal(accumulator)}\n")
+    printf(p"RoCC DUT Cycle[${dutCycleCount}]: Inputs: start=${io.start}, ifm_rd_data=${io.ifm_read_data}, krnl_rd_data=${io.kernel_read_data}\n")
+    printf(p"RoCC DUT Cycle[${dutCycleCount}]: Outputs: ifm_addr=${io.ifm_read_addr}, krnl_addr=${io.kernel_read_addr}\n")
+    printf(p"RoCC DUT Cycle[${dutCycleCount}]: Outputs: ofm_wr_en=${io.ofm_write_en}, ofm_wr_addr=${io.ofm_write_addr}, ofm_data=${io.ofm_write_data} (dec)\n")
   }
 
   switch(state) {
@@ -119,7 +119,7 @@ class ComputeUnit(val config: AcceleratorConfig) extends Module {
         data_fetch_cycle := true.B
 
         if (enableDebugPrints.litToBoolean) {
-            printf(p"DUT Cycle[${dutCycleCount}]: sFetchIFM (Cycle 1): out_r=${out_r}, out_c=${out_c}, k_r=${k_r}, k_c=${k_c} => ifm_r_eff=${ifm_r_eff}, ifm_c_eff=${ifm_c_eff}. Padded? ${current_ifm_access_is_pad}. IFM Addr Sent: ${io.ifm_read_addr}\n")
+            printf(p"RoCC DUT Cycle[${dutCycleCount}]: sFetchIFM (Cycle 1): out_r=${out_r}, out_c=${out_c}, k_r=${k_r}, k_c=${k_c} => ifm_r_eff=${ifm_r_eff}, ifm_c_eff=${ifm_c_eff}. Padded? ${current_ifm_access_is_pad}. IFM Addr Sent: ${io.ifm_read_addr}\n")
         }
       } .otherwise { // Second cycle of sFetchIFM: latch data
         when(ifm_access_is_pad) {
@@ -198,6 +198,6 @@ class ComputeUnit(val config: AcceleratorConfig) extends Module {
     }
   }
   if (enableDebugPrints.litToBoolean) {
-    printf(p"DUT Cycle[${dutCycleCount}]: -------------------- Cycle End ----------------------\n")
+    printf(p"RoCC DUT Cycle[${dutCycleCount}]: -------------------- Cycle End ----------------------\n")
   }
 }
