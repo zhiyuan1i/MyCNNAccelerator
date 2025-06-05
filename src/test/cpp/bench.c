@@ -96,7 +96,7 @@
 
 // Global variable to control RoCC polling verbosity
 // Set this to 1 for detailed prints, 0 for less verbose
-#define g_verbose_rocc_polling 1
+#define g_verbose_rocc_polling 0
 
 static inline uint64_t rdcycle_custom(void) {
     uint64_t cycles;
@@ -327,7 +327,7 @@ int main(void) {
         printf("CPU %dx%d Kernel Cycles: %lu\n", k_dim, k_dim, cpu_cycles);
 
         if (cpu_cycles > 0 && rocc_op_cycles > 0) {
-             printf("RoCC Speedup vs CPU for %dx%d: %.2fx\n", k_dim, k_dim, (double)cpu_cycles / rocc_op_cycles);
+            printf("RoCC Speedup vs CPU for %dx%d: %.2f\n", k_dim, k_dim, (double)cpu_cycles / rocc_op_cycles);
         }
         printf("\n");
     }
