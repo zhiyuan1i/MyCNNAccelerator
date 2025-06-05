@@ -57,7 +57,7 @@ class SimpleDMAEngineModuleImp(outer: SimpleDMAEngine)(implicit p: Parameters) e
   val io = IO(new SimpleDMATLModuleIO(outer.accConfig, coreMaxAddrBits)(p))
   val (tl, edge) = outer.node.out.head
 
-  val enableDmaDebugPrints = true.B // Keep this true for focused debugging
+  val enableDmaDebugPrints = false.B // Keep this true for focused debugging
 
   val dmaCycleCount = RegInit(0.U(32.W))
   if (enableDmaDebugPrints.litToBoolean) {

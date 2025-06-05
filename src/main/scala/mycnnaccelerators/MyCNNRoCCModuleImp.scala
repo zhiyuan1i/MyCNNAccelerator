@@ -16,7 +16,7 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
 
   val config = defaultConfig.copy(xLen = xLen, kernelRows = 5, kernelCols = 5) // Ensure config uses max kernel size for buffers
 
-  val enableRoccDebugPrints = true.B
+  val enableRoccDebugPrints = false.B
 
   val roccCycleCount = RegInit(0.U(32.W))
   when(enableRoccDebugPrints) {
@@ -66,8 +66,18 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
 
   val ofm_dma_read_print_count = RegInit(0.U(4.W))
 
+  val is_get_status_command = WireDefault(false.B)
+  when(io.cmd.valid) {
+      is_get_status_command := io.cmd.bits.inst.funct === CMD_GET_STATUS
+  }
 
-  io.cmd.ready := (rocc_state === sIdle) && !resp_valid_reg && !dma_ctrl_io.busy && !compute_unit.io.busy
+  val get_status_can_be_accepted = is_get_status_command
+
+  val other_commands_can_be_accepted = !is_get_status_command && !dma_ctrl_io.busy && !compute_unit.io.busy
+
+  val rocc_interface_ready = (rocc_state === sIdle) && !resp_valid_reg
+
+  io.cmd.ready := rocc_interface_ready && (get_status_can_be_accepted || other_commands_can_be_accepted)
   io.resp.valid := resp_valid_reg
   io.resp.bits.rd := resp_rd_reg
   io.resp.bits.data := resp_data_reg
@@ -158,7 +168,7 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
         }
         rocc_state := sDmaActive
       }
-      when(io.cmd.valid && !resp_valid_reg) {
+      when(io.cmd.valid && !resp_valid_reg) { // Note: io.cmd.ready implicitly handled by FSM and this check
         val cmd = io.cmd.bits
         resp_rd_reg := cmd.inst.rd
         resp_data_reg := STATUS_ERROR.asUInt // Default to error, override on success
@@ -189,11 +199,11 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
               } .otherwise {
                 if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_START_COMPUTE: Error - Invalid kernel_dim_reg=${current_kernel_dim_reg}. Responding STATUS_ERROR.\n")}
                 accelerator_status_reg := STATUS_ERROR // Set error status
-                                // resp_data_reg already STATUS_ERROR by default
+                                        // resp_data_reg already STATUS_ERROR by default
               }
             } .otherwise {
               if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_START_COMPUTE: Error - preconditions not met. Responding STATUS_ERROR.\n")}
-               accelerator_status_reg := STATUS_ERROR // Set error status
+                accelerator_status_reg := STATUS_ERROR // Set error status
             }
           }
           is(CMD_DMA_CONFIG_ADDR) {
@@ -241,8 +251,8 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
                       when(current_kernel_dim_reg === 1.U || current_kernel_dim_reg === 3.U || current_kernel_dim_reg === 5.U) {
                           can_start_dma := true.B
                       } .otherwise {
-                           if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_START: Error - KERNEL load with invalid dim ${current_kernel_dim_reg}.\n")}
-                           accelerator_status_reg := STATUS_ERROR // Set error
+                          if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_START: Error - KERNEL load with invalid dim ${current_kernel_dim_reg}.\n")}
+                          accelerator_status_reg := STATUS_ERROR // Set error
                       }
                   } .otherwise { // IFM load
                       can_start_dma := true.B
@@ -263,7 +273,7 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
               // If can_start_dma is false and accelerator_status_reg wasn't already set to an error by a condition above
               when (accelerator_status_reg =/= STATUS_ERROR && accelerator_status_reg =/= STATUS_DMA_ERROR) {
                 if (enableRoccDebugPrints.litToBoolean) { printf(p"RoCC Cycle[${roccCycleCount}]: CMD_DMA_START: Error - conditions not met. Responding STATUS_ERROR.\n")}
-                 // resp_data_reg is already STATUS_ERROR by default
+                  // resp_data_reg is already STATUS_ERROR by default
               }
             }
           }
@@ -380,13 +390,13 @@ class MyCNNRoCCModuleImp(outer: MyCNNRoCC, defaultConfig: AcceleratorConfig)(imp
   val spad_write_target_is_ifm    = dma_buffer_id_reg === BufferIDs.IFM    && dma_is_writing_to_spad
   val spad_write_target_is_kernel = dma_buffer_id_reg === BufferIDs.KERNEL && dma_is_writing_to_spad
 
-  ifm_buffer.io.write_en    := dma_ctrl_io.spad_write_en && spad_write_target_is_ifm
-  ifm_buffer.io.write_addr  := dma_ctrl_io.spad_write_addr
-  ifm_buffer.io.write_data  := dma_ctrl_io.spad_write_data
+  ifm_buffer.io.write_en     := dma_ctrl_io.spad_write_en && spad_write_target_is_ifm
+  ifm_buffer.io.write_addr   := dma_ctrl_io.spad_write_addr
+  ifm_buffer.io.write_data   := dma_ctrl_io.spad_write_data
 
-  kernel_buffer.io.write_en    := dma_ctrl_io.spad_write_en && spad_write_target_is_kernel
-  kernel_buffer.io.write_addr := dma_ctrl_io.spad_write_addr
-  kernel_buffer.io.write_data := dma_ctrl_io.spad_write_data
+  kernel_buffer.io.write_en     := dma_ctrl_io.spad_write_en && spad_write_target_is_kernel
+  kernel_buffer.io.write_addr  := dma_ctrl_io.spad_write_addr
+  kernel_buffer.io.write_data  := dma_ctrl_io.spad_write_data
 
   ofm_buffer.io.read_addr    := dma_ctrl_io.spad_read_addr
   dma_ctrl_io.spad_read_data := 0.S

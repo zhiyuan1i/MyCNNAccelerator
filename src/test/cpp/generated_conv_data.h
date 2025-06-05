@@ -6,6 +6,7 @@
 #define GEN_MAX_KERNEL_DIM 5
 #define GEN_OFM_ROWS 32
 #define GEN_OFM_COLS 32
+#define DATA_WIDTH_BYTES 2
 
 const int16_t generated_ifm_data[1024] = {
     -1280, 640, 256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 
