@@ -16,8 +16,8 @@
 #define CUSTOM_2 0b1011011
 #define CUSTOM_3 0b1111011
 #define CUSTOMX(X, xd, xs1, xs2, rd, rs1, rs2, funct) \
-  CUSTOMX_OPCODE(X)                       | \
-  (rd                           << (7))          | \
+  CUSTOMX_OPCODE(X)                           | \
+  (rd                           << (7))            | \
   (EXTRACT(funct, 7, 0) << (7+5+3+5+5))   | \
   (rs2                          << (7+5+3+5))      | \
   (rs1                          << (7+5+3))        | \
@@ -68,8 +68,8 @@
 #define DMA_DIR_MEM_TO_BUF 0
 #define DMA_DIR_BUF_TO_MEM 1
 
-#define DMA_PARAM_BUF_ID_BITS     2
-#define DMA_PARAM_DIR_BITS        1
+#define DMA_PARAM_BUF_ID_BITS       2
+#define DMA_PARAM_DIR_BITS          1
 #define DMA_PARAM_BUF_ID_DIR_TOTAL_BITS (DMA_PARAM_BUF_ID_BITS + DMA_PARAM_DIR_BITS)
 // --- End RoCC Instruction Header and ISA Definitions ---
 
@@ -148,13 +148,9 @@ const int16_t *kernel_data_memory_ptr = generated_kernel_data_5x5;
 int16_t ofm_rocc_output_data[OFM_ROWS * OFM_COLS];
 int16_t ofm_cpu_output_data[OFM_ROWS * OFM_COLS];
 
-// Restored verbose poll_status_until function
 int poll_status_until(uint64_t target_status, uint64_t error_status1, uint64_t error_status2, const char* operation_name, int max_retries) {
     uint64_t current_status;
     int attempts = 0;
-    // if (g_verbose_rocc_polling) {
-    //     printf("Polling for %s (target: %lu)...\n", operation_name, target_status);
-    // }
     do {
         current_status = rocc_get_status();
         if (current_status == target_status) {
@@ -163,24 +159,13 @@ int poll_status_until(uint64_t target_status, uint64_t error_status1, uint64_t e
             }
             return 0; // Success
         }
-        // if (current_status == error_status1 || current_status == error_status2) {
-        //     // This error is critical, so always print it
-        //     printf("Error during %s. Status: %lu\n", operation_name, current_status);
-        //     return -1; // Error
-        // }
+        if (current_status == error_status1 || current_status == error_status2) {
+            printf("Error during %s. Status: %lu\n", operation_name, current_status);
+            return -1; // Error
+        }
         attempts++;
-        // if (g_verbose_rocc_polling && attempts > 0) {
-        //     int print_interval = max_retries / 20;
-        //     if (print_interval == 0) print_interval = 1; // Avoid division by zero and ensure some prints
-
-        //     if (attempts == 1 || attempts == (max_retries -1) || (attempts % print_interval == 0) ) {
-        //          printf("Still waiting for %s... Status: %lu (target: %lu), Attempts: %d/%d\n",
-        //                operation_name, current_status, target_status, attempts, max_retries);
-        //     }
-        // }
     } while (attempts < max_retries);
 
-    // This timeout is critical, so always print it
     printf("Timeout waiting for %s. Last status: %lu (Target: %lu), Attempts: %d\n", operation_name, current_status, target_status, attempts);
     return -1; // Timeout
 }
@@ -212,7 +197,6 @@ void cpu_convolution_same_padding(const int16_t *ifm,
     }
 }
 
-// run_rocc_convolution with conditional prints
 int run_rocc_convolution(int kernel_dim_to_test, uint64_t *rocc_cycles) {
     uint64_t start_cycle_total, end_cycle_total;
 
@@ -220,9 +204,9 @@ int run_rocc_convolution(int kernel_dim_to_test, uint64_t *rocc_cycles) {
         ofm_rocc_output_data[i] = 0;
     }
 
-    uint64_t ifm_addr    = (uint64_t)ifm_data_ptr;
-    uint64_t kernel_addr = (uint64_t)kernel_data_memory_ptr;
-    uint64_t ofm_addr    = (uint64_t)ofm_rocc_output_data;
+    uint64_t ifm_addr     = (uint64_t)ifm_data_ptr;
+    uint64_t kernel_addr  = (uint64_t)kernel_data_memory_ptr;
+    uint64_t ofm_addr     = (uint64_t)ofm_rocc_output_data;
 
     uint64_t ifm_len_bytes    = (uint64_t)IFM_ROWS * IFM_COLS * DATA_WIDTH_BYTES;
     uint64_t kernel_len_bytes = (uint64_t)kernel_dim_to_test * kernel_dim_to_test * DATA_WIDTH_BYTES;
@@ -272,21 +256,20 @@ int run_rocc_convolution(int kernel_dim_to_test, uint64_t *rocc_cycles) {
     uint64_t final_status = rocc_get_status();
     if (g_verbose_rocc_polling) {
          printf("RoCC Info: Kernel %dx%d Test Case Finished. Final Status: %lu (Expected IDLE: %d or OFM_DONE: %d)\n",
-            kernel_dim_to_test, kernel_dim_to_test, final_status, STATUS_IDLE, STATUS_DMA_OFM_STORE_DONE);
+             kernel_dim_to_test, kernel_dim_to_test, final_status, STATUS_IDLE, STATUS_DMA_OFM_STORE_DONE);
     }
-    // Critical errors (timeout/dma error from polling) already return 1.
-    // This is a softer check for unexpected final state if all polls passed.
+    
     if (!((final_status == STATUS_IDLE || final_status == STATUS_DMA_OFM_STORE_DONE))) {
-        // This printf is important if polling passed but final state is odd.
         printf("Warning: RoCC K=%d final status %lu is unexpected after successful polling.\n", kernel_dim_to_test, final_status);
-        // Consider if this should also return 1 to mark the run as problematic.
-        // For now, only polling failures cause a hard fail (return 1).
     }
     return 0;
 }
 
 int main(void) {
-    uint64_t cpu_cycles, rocc_op_cycles;
+    int kernel_dims_to_test[] = {1, 3, 5};
+    int num_kernel_dims = sizeof(kernel_dims_to_test) / sizeof(kernel_dims_to_test[0]);
+    uint64_t rocc_cycles[num_kernel_dims];
+    uint64_t cpu_cycles[num_kernel_dims];
 
     printf("Starting CNN Accelerator Benchmark (IFM: %dx%d, OFM: %dx%d)\n",
            IFM_ROWS, IFM_COLS, OFM_ROWS, OFM_COLS);
@@ -297,37 +280,53 @@ int main(void) {
     }
     printf("CPU convolution uses F_BITS_FOR_CPU_SCALING = %d\n\n", F_BITS_FOR_CPU_SCALING);
 
-    int kernel_dims_to_test[] = {1, 3, 5};
-    int num_kernel_dims = sizeof(kernel_dims_to_test) / sizeof(kernel_dims_to_test[0]);
-
+    // --- Stage 1: Run all RoCC accelerator tests ---
+    printf("--- Running All RoCC Accelerator Tests ---\n");
     for (int i = 0; i < num_kernel_dims; ++i) {
         int k_dim = kernel_dims_to_test[i];
-        printf("--- Kernel Dimension: %dx%d ---\n", k_dim, k_dim);
-
-        // RoCC Convolution
-        if (g_verbose_rocc_polling) {
-            printf("Running RoCC for %dx%d kernel...\n", k_dim, k_dim);
-        }
-        if (run_rocc_convolution(k_dim, &rocc_op_cycles) == 0) {
-            printf("RoCC %dx%d Kernel Cycles: %lu\n", k_dim, k_dim, rocc_op_cycles);
+        printf("Benchmarking RoCC for %dx%d kernel...\n", k_dim, k_dim);
+        if (run_rocc_convolution(k_dim, &rocc_cycles[i]) != 0) {
+            printf("RoCC %dx%d Kernel Test: FAILED\n", k_dim, k_dim);
+            rocc_cycles[i] = 0; // Mark as failed
         } else {
-            printf("RoCC %dx%d Kernel Test: FAILED (see error/timeout messages above)\n", k_dim, k_dim);
-            rocc_op_cycles = 0; 
+            // Print cycles immediately after the test
+            printf("RoCC %dx%d Kernel Cycles: %lu\n", k_dim, k_dim, rocc_cycles[i]);
         }
+        printf("\n"); // Add a newline for better spacing
+    }
+    printf("--- All RoCC Tests Finished ---\n\n");
 
-        // CPU Convolution
-        if (g_verbose_rocc_polling) {
-            printf("Running CPU for %dx%d kernel...\n", k_dim, k_dim);
-        }
+    // --- Stage 2: Run all CPU baseline tests ---
+    printf("--- Running All CPU Baseline Tests ---\n");
+    for (int i = 0; i < num_kernel_dims; ++i) {
+        int k_dim = kernel_dims_to_test[i];
+        printf("Benchmarking CPU for %dx%d kernel...\n", k_dim, k_dim);
         uint64_t start_cpu = rdcycle_custom();
         cpu_convolution_same_padding(ifm_data_ptr, kernel_data_memory_ptr, ofm_cpu_output_data,
                                      IFM_ROWS, IFM_COLS, k_dim, MAX_KERNEL_DIM);
         uint64_t end_cpu = rdcycle_custom();
-        cpu_cycles = end_cpu - start_cpu;
-        printf("CPU %dx%d Kernel Cycles: %lu\n", k_dim, k_dim, cpu_cycles);
+        cpu_cycles[i] = end_cpu - start_cpu;
+        // Print cycles immediately after the test
+        printf("CPU %dx%d Kernel Cycles: %lu\n\n", k_dim, k_dim, cpu_cycles[i]);
+    }
+    printf("--- All CPU Tests Finished ---\n\n");
 
-        if (cpu_cycles > 0 && rocc_op_cycles > 0) {
-            printf("RoCC Speedup vs CPU for %dx%d: %.2f\n", k_dim, k_dim, (double)cpu_cycles / rocc_op_cycles);
+    // --- Stage 3: Print summary of results ---
+    printf("--- Benchmark Results Summary ---\n");
+    for (int i = 0; i < num_kernel_dims; ++i) {
+        int k_dim = kernel_dims_to_test[i];
+        printf("--- Kernel Dimension: %dx%d ---\n", k_dim, k_dim);
+
+        if (rocc_cycles[i] > 0) {
+             printf("RoCC Cycles: %lu\n", rocc_cycles[i]);
+        } else {
+             printf("RoCC Test: FAILED or SKIPPED\n");
+        }
+
+        printf("CPU Cycles:  %lu\n", cpu_cycles[i]);
+
+        if (cpu_cycles[i] > 0 && rocc_cycles[i] > 0) {
+            printf("RoCC Speedup vs CPU: %.2fx\n", (double)cpu_cycles[i] / rocc_cycles[i]);
         }
         printf("\n");
     }
