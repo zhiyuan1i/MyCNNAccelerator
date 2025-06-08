@@ -25,8 +25,8 @@ object CNNAcceleratorISA {
   val STATUS_LOADING_KERNEL    = 2.U(8.W) // Will be replaced by DMA status
   val STATUS_COMPUTING         = 3.U(8.W)
   val STATUS_COMPUTE_DONE      = 4.U(8.W)
+  val STATUS_COMPUTE_DONE_SATURATED = 5.U(8.W)
 
-  // New DMA Status codes
   val STATUS_DMA_BUSY             = 10.U(8.W) // General DMA busy
   val STATUS_DMA_CONFIG_READY     = 11.U(8.W) // DMA configured, ready to start
   val STATUS_DMA_IFM_LOAD_DONE    = 12.U(8.W)

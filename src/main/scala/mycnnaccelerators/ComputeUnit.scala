@@ -8,6 +8,8 @@ class ComputeUnitIO(val config: AcceleratorConfig) extends Bundle {
   val start = Input(Bool())
   val busy  = Output(Bool())
   val done  = Output(Bool())
+  // New output to signal that a saturation event has occurred at least once
+  val saturation_event = Output(Bool())
 
   // Inputs for actual kernel dimensions to use for this computation
   // Width is based on max possible kernel dimension (e.g., up to 5 for 5x5)
@@ -37,25 +39,22 @@ class ComputeUnit(val config: AcceleratorConfig) extends Module {
   val out_r = RegInit(0.U(log2Ceil(config.ifmRows).W))
   val out_c = RegInit(0.U(log2Ceil(config.ifmCols).W))
 
-  // k_r and k_c iterators use width of max kernel dimension
-  val k_r    = RegInit(0.U(log2Ceil(config.kernelRows).W))
-  val k_c    = RegInit(0.U(log2Ceil(config.kernelCols).W))
+  val k_r = RegInit(0.U(log2Ceil(config.kernelRows).W))
+  val k_c = RegInit(0.U(log2Ceil(config.kernelCols).W))
 
-  // Dynamic padding calculation based on actual_kernel_dim_in
-  // Ensure actual_kernel_dim_in is never zero if it can be. For 1x1, 3x3, 5x5, it's fine.
   val current_kernel_dim = io.actual_kernel_dim_in
-  val pad_val = Wire(UInt(log2Ceil(config.kernelRows).W)) // Max possible padding
+  val pad_val = Wire(UInt(log2Ceil(config.kernelRows).W))
 
   when(current_kernel_dim > 1.U) {
     pad_val := (current_kernel_dim - 1.U) / 2.U
   } .otherwise {
-    pad_val := 0.U // No padding for 1x1 kernel, or if kernel_dim is 1
+    pad_val := 0.U
   }
   val pad_rows_val = pad_val
   val pad_cols_val = pad_val
 
 
-  val guardBits = log2Ceil(config.kernelRows * config.kernelCols) // Max possible accumulation
+  val guardBits = log2Ceil(config.kernelRows * config.kernelCols)
   val accWidth = (2 * config.dataWidth) + guardBits
   val accumulator = RegInit(0.S(accWidth.W))
 
@@ -64,32 +63,53 @@ class ComputeUnit(val config: AcceleratorConfig) extends Module {
   val data_fetch_cycle = RegInit(false.B)
   val ifm_access_is_pad = RegInit(false.B)
 
+  // This sticky register will be set if saturation occurs at any point
+  val saturation_occurred_reg = RegInit(false.B)
+
   io.busy := (state =/= sIdle) && (state =/= sDoneCU)
   io.done := (state === sDoneCU)
+  io.saturation_event := saturation_occurred_reg
 
   io.ifm_read_addr   := 0.U
   io.kernel_read_addr:= 0.U
   io.ofm_write_en    := false.B
-
-  val shifted_accumulator = (accumulator >> config.F_BITS)
-  io.ofm_write_data  := shifted_accumulator(config.dataWidth - 1, 0).asSInt
   io.ofm_write_addr  := out_r * config.ifmCols.U + out_c
 
-  val enableDebugPrints = false.B // Set to true for local debugging
+  // --- Saturation Logic ---
+  val minSIntValue = -(BigInt(1) << (config.dataWidth - 1))
+  val maxSIntValue = (BigInt(1) << (config.dataWidth - 1)) - 1
+  val shifted_accumulator = (accumulator >> config.F_BITS).asSInt
+
+  val is_saturating_high = shifted_accumulator > maxSIntValue.S
+  val is_saturating_low  = shifted_accumulator < minSIntValue.S
+
+  val saturated_ofm_data = Wire(SInt(config.dataWidth.W))
+  when(is_saturating_high) {
+    saturated_ofm_data := maxSIntValue.S(config.dataWidth.W)
+  } .elsewhen(is_saturating_low) {
+    saturated_ofm_data := minSIntValue.S(config.dataWidth.W)
+  } .otherwise {
+    saturated_ofm_data := shifted_accumulator(config.dataWidth - 1, 0).asSInt
+  }
+  io.ofm_write_data := saturated_ofm_data
+  // --- End of Saturation Logic ---
+
+
+  val enableDebugPrints = false.B
   if (enableDebugPrints.litToBoolean) {
     printf(p"RoCC DUT Cycle[${dutCycleCount}]: State=${state}, actual_k_dim=${current_kernel_dim}, pad_val=${pad_val}\n")
-    // Add more prints if needed
   }
 
   switch(state) {
     is(sIdle) {
       when(io.start) {
-        out_r       := 0.U
-        out_c       := 0.U
-        k_r         := 0.U
-        k_c         := 0.U
-        accumulator := 0.S
-        state       := sFetchIFM
+        out_r        := 0.U
+        out_c        := 0.U
+        k_r          := 0.U
+        k_c          := 0.U
+        accumulator  := 0.S
+        saturation_occurred_reg := false.B // Reset flag on start
+        state        := sFetchIFM
         data_fetch_cycle := false.B
         ifm_access_is_pad := false.B
       }
@@ -123,10 +143,6 @@ class ComputeUnit(val config: AcceleratorConfig) extends Module {
 
     is(sFetchKernel) {
       when(!data_fetch_cycle) {
-        // Kernel address calculation uses actual kernel cols (which is current_kernel_dim for square kernels)
-        // but it reads from a buffer sized for config.kernelCols (max).
-        // The address should be k_r * <actual_kernel_cols_for_this_op> + k_c
-        // For square kernels, actual_kernel_cols_for_this_op is current_kernel_dim
         io.kernel_read_addr := k_r * current_kernel_dim + k_c
         data_fetch_cycle := true.B
       } .otherwise {
@@ -140,7 +156,6 @@ class ComputeUnit(val config: AcceleratorConfig) extends Module {
       val product = (ifm_data_reg * kernel_data_reg).asSInt
       accumulator := accumulator + product
 
-      // Loop bounds use current_kernel_dim
       val k_c_is_last = (k_c === (current_kernel_dim - 1.U))
       when(k_c_is_last) {
         k_c := 0.U
@@ -159,7 +174,13 @@ class ComputeUnit(val config: AcceleratorConfig) extends Module {
     }
 
     is(sWriteOFM) {
-      io.ofm_write_en    := true.B
+      io.ofm_write_en := true.B
+      
+      // If saturation is detected during this write cycle, set the sticky flag
+      when(is_saturating_high || is_saturating_low) {
+        saturation_occurred_reg := true.B
+      }
+
       accumulator := 0.S
 
       val out_c_is_last = (out_c === (config.ifmCols.U - 1.U))
@@ -184,7 +205,7 @@ class ComputeUnit(val config: AcceleratorConfig) extends Module {
     }
 
     is(sDoneCU) {
-      when(!io.start) { // Wait for start to be de-asserted before going to Idle
+      when(!io.start) {
         state := sIdle
       }
     }
