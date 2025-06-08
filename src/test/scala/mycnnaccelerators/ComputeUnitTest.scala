@@ -22,7 +22,7 @@ object ReferenceConvolution {
     ifm: Seq[Seq[Double]],
     kernel: Seq[Seq[Double]],
     config: AcceleratorConfig // This config's IFM/Kernel dimensions and F_BITS are used.
-                              // Output is IFM-sized.
+                                  // Output is IFM-sized.
   ): Seq[Seq[Double]] = {
     val outputRows = config.ifmRows // 'Same' convolution output rows = IFM rows
     val outputCols = config.ifmCols // 'Same' convolution output cols = IFM cols
@@ -94,7 +94,7 @@ class ComputeUnitTest extends AnyFlatSpec {
         kernelCols = actualKernelColsForDUT,
         xLen = 64,
         isSameConvolution = true // Assuming AcceleratorConfig takes such a parameter
-                                  // or calculates OFM dims for 'same' by default now.
+                                    // or calculates OFM dims for 'same' by default now.
       )
 
       // For 'same' convolution, output dimensions are same as input IFM dimensions
@@ -143,6 +143,8 @@ class ComputeUnitTest extends AnyFlatSpec {
         }
         dut.io.kernel_buffer_write_en.poke(false.B)
 
+        dut.io.actual_kernel_dim_in.poke(actualKernelRowsForDUT.U)
+      
         dut.io.ofm_buffer_read_addr.poke(0.U)
         dut.io.start.poke(false.B)
         dut.clock.step(1); cycles +=1

@@ -1,4 +1,4 @@
-// Suggested to be in a new file or at the top of ComputeUnitTest.scala
+// filename: ComputeUnitSystemWrapper.scala (Corrected)
 package mycnnaccelerators
 
 import chisel3._
@@ -8,6 +8,8 @@ class ComputeUnitSystemWrapperIO(val config: AcceleratorConfig) extends Bundle {
   // Control for ComputeUnit
   val start = Input(Bool())
   val done = Output(Bool()) // From ComputeUnit
+  // ADD THE MISSING KERNEL DIMENSION INPUT
+  val actual_kernel_dim_in = Input(UInt(log2Ceil(config.kernelRows + 1).W))
 
   // Ports for Testbench to pre-load IFM buffer
   val ifm_buffer_write_en = Input(Bool())
@@ -30,7 +32,7 @@ class ComputeUnitSystemWrapper(val config: AcceleratorConfig) extends Module {
   val ifm_buffer    = Module(new MinimalBuffer(config.ifmDepth, config.dataWidth))
   val kernel_buffer = Module(new MinimalBuffer(config.kernelDepth, config.dataWidth))
   val ofm_buffer    = Module(new MinimalBuffer(config.ofmDepth, config.dataWidth))
-  val compute_unit  = Module(new ComputeUnit(config)) // Using your reverted 1-cycle address CU
+  val compute_unit  = Module(new ComputeUnit(config))
 
   // Connect Testbench to IFM Buffer for writing
   ifm_buffer.io.write_en   := io.ifm_buffer_write_en
@@ -53,10 +55,12 @@ class ComputeUnitSystemWrapper(val config: AcceleratorConfig) extends Module {
   ofm_buffer.io.write_addr := compute_unit.io.ofm_write_addr
   ofm_buffer.io.write_data := compute_unit.io.ofm_write_data
   // Testbench reads from OFM Buffer
-  ofm_buffer.io.read_addr    := io.ofm_buffer_read_addr
-  io.ofm_buffer_read_data  := ofm_buffer.io.read_data
+  ofm_buffer.io.read_addr   := io.ofm_buffer_read_addr
+  io.ofm_buffer_read_data   := ofm_buffer.io.read_data
 
   // Connect ComputeUnit start/done signals
   compute_unit.io.start := io.start
   io.done               := compute_unit.io.done
+  // ADD THE MISSING CONNECTION FOR THE KERNEL DIMENSION
+  compute_unit.io.actual_kernel_dim_in := io.actual_kernel_dim_in
 }
