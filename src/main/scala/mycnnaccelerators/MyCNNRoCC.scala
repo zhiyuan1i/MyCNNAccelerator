@@ -19,7 +19,8 @@ class MyCNNRoCC(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opc
   // Instantiate the DMA LazyModule.
   // The AcceleratorConfig might need xLen, which is known in the ModuleImp.
   // SimpleDMAEngine takes accConfig.
-  val dma_engine_lazy = LazyModule(new SimpleDMAEngine(baseConfig))
+  // val dma_engine_lazy = LazyModule(new SimpleDMAEngine(baseConfig))
+  val dma_engine_lazy = LazyModule(new PipelinedDMAEngine(baseConfig))
 
   // This RoCC will use the dma_engine_lazy's TileLink node as its primary memory master interface.
   // Override atlNode from CanHavePTW (mixed into LazyRoCC) or a similar node if defined by LazyRoCC.
